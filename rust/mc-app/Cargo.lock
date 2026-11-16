@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "mc-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wasapi",
  "windows",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "mousecam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mc-api",
  "mc-engine",

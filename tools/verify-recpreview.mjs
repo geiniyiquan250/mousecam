@@ -70,7 +70,11 @@ const check = (n, ok, d = '') => { results.push({ n, ok }); console.log(`${ok ? 
 
   // parameter feedback: zoom changes the crop size
   await cdp.eval(`(() => { const inp = document.getElementById('recParamsGrid').querySelectorAll('input[type=range]')[0];
-    inp.value = 2.4; inp.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    // pick a value different from the current one: the parameters persist in
+    // localStorage, so a fixed target passes or fails on leftover state
+    const now = Number(inp.value);
+    inp.value = Math.abs(now - 2.4) > 0.2 ? 2.4 : 1.6;
+    inp.dispatchEvent(new Event('input', { bubbles: true })); })()`);
   await sleep(1600);
   const size2 = await cdp.eval(`document.getElementById('recCropInfo').textContent`);
   check('参数实时影响预览', size1 !== size2, `${size1} -> ${size2}`);

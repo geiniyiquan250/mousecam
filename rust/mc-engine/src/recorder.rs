@@ -14,6 +14,125 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Where the camera reads the pointer from.
+///
+/// `Scripted` and `Injected` exist so a recording can be exercised without
+/// touching the machine's real pointer - which is the only way to test the
+/// follow camera while somebody else is using the desktop.
+#[derive(Clone)]
+pub enum CursorSource {
+    Real,
+    /// A smooth path derived from the clock, with a fast segment so the
+    /// speed-driven viewport gets exercised too.
+    Scripted,
+    /// Positions pushed from outside (tests drive this).
+    Injected(Arc<std::sync::Mutex<Vec2>>),
+}
+
+/// Copy a rectangle out of a frame, row by row.
+fn copy_rect(src: &[u32], stride: i32, x: i32, y: i32, w: i32, h: i32) -> Vec<u32> {
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for row in 0..h {
+        let s = ((y + row) * stride + x) as usize;
+        out.extend_from_slice(&src[s..s + w as usize]);
+    }
+    out
+}
+
+/// Put a rectangle back, row by row.
+fn paste_rect(dst: &mut [u32], stride: i32, x: i32, y: i32, w: i32, h: i32, data: &[u32]) {
+    for row in 0..h {
+        let d = ((y + row) * stride + x) as usize;
+        let s = (row * w) as usize;
+        dst[d..d + w as usize].copy_from_slice(&data[s..s + w as usize]);
+    }
+}
+
+fn scripted_pos(mon: IRect, t: f64) -> Vec2 {
+    let w = mon.w as f32;
+    let h = mon.h as f32;
+    let a = t as f32 * 5.0;
+    Vec2::new(
+        mon.x as f32 + w * (0.5 + 0.30 * a.cos()),
+        mon.y as f32 + h * (0.5 + 0.28 * (a * 0.63).sin()),
+    )
+}
+
+fn read_cursor(src: &CursorSource, mon: IRect, t: f64) -> Vec2 {
+    match src {
+        CursorSource::Real => cursor_pos(),
+        CursorSource::Scripted => scripted_pos(mon, t),
+        CursorSource::Injected(slot) => *slot.lock().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// What the recorder is doing right now, published for diagnostics.
+///
+/// Without this, answering "why was that take slow" means adding a log line and
+/// rebuilding; the numbers are already here, they just had nowhere to go.
+#[derive(Default)]
+pub struct FrameStats {
+    pub frames: i64,
+    pub dropped: u32,
+    pub last_ms: f32,
+    pub p95_ms: f32,
+    pub expand: f32,
+    pub speed: f32,
+    pub center: [f32; 2],
+    pub src: [f32; 2],
+    /// Where the frame time goes, so an optimisation can target the real cost.
+    pub grab_ms: f32,
+    pub master_ms: f32,
+    pub resample_ms: f32,
+    pub camera_ms: f32,
+    pub write_ms: f32,
+    recent: std::collections::VecDeque<f32>,
+}
+
+/// A copy without the per-frame ring, which is what callers actually need.
+#[derive(Default, Clone, Copy)]
+pub struct StatsSnapshot {
+    pub frames: i64,
+    pub grab_ms: f32,
+    pub master_ms: f32,
+    pub resample_ms: f32,
+    pub camera_ms: f32,
+    pub write_ms: f32,
+    pub dropped: u32,
+    pub last_ms: f32,
+    pub p95_ms: f32,
+    pub expand: f32,
+    pub speed: f32,
+    pub center: [f32; 2],
+    pub src: [f32; 2],
+}
+
+impl FrameStats {
+    pub fn clone_stats(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            frames: self.frames,
+            grab_ms: self.grab_ms,
+            master_ms: self.master_ms,
+            camera_ms: self.camera_ms,
+            resample_ms: self.resample_ms,
+            write_ms: self.write_ms,
+            dropped: self.dropped,
+            last_ms: self.last_ms,
+            p95_ms: self.p95_ms,
+            expand: self.expand,
+            speed: self.speed,
+            center: self.center,
+            src: self.src,
+        }
+    }
+}
+
+pub type DebugSink = Arc<std::sync::Mutex<FrameStats>>;
+
+pub fn new_debug_sink() -> DebugSink {
+    Arc::new(std::sync::Mutex::new(FrameStats::default()))
+}
+
 /// One downscaled follow-cam frame, shared with whoever shows a live preview.
 #[derive(Clone)]
 pub struct PreviewShot {
@@ -37,9 +156,19 @@ pub struct RecorderConfig {
     pub quality: i32,
     pub camera_format: VideoFormat,
     pub camera_quality: i32,
+    /// capture the desktop's own sound (WASAPI loopback)
+    pub audio_system: bool,
+    /// capture the microphone
+    pub audio_mic: bool,
     /// optional live preview output (the recorder is the only owner of the
     /// DXGI duplication, so it has to publish frames itself)
     pub preview: Option<PreviewSink>,
+    /// optional live telemetry
+    pub debug: Option<DebugSink>,
+    /// generate frames instead of reading the desktop (tests only)
+    pub synthetic: bool,
+    /// where the follow camera reads the pointer from
+    pub cursor: CursorSource,
 }
 
 impl Default for RecorderConfig {
@@ -53,7 +182,12 @@ impl Default for RecorderConfig {
             quality: 20,
             camera_format: VideoFormat::Mp4H264,
             camera_quality: 22,
+            audio_system: false,
+            audio_mic: false,
             preview: None,
+            debug: None,
+            synthetic: false,
+            cursor: CursorSource::Real,
         }
     }
 }
@@ -81,7 +215,59 @@ fn now_stamp() -> String {
     }
 }
 
-fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64) -> String {
+/// Folds the captured tracks into an already-encoded video, straight-copying the
+/// picture so only the audio is re-encoded. `-af apad` plus `-shortest` make the
+/// video govern the length: the audio is padded rather than cutting the picture.
+fn mux_audio(ffmpeg: &Path, video: &Path, tracks: &[std::path::PathBuf]) -> Result<(), String> {
+    if tracks.is_empty() || !video.exists() {
+        return Ok(());
+    }
+    let tmp = video.with_file_name(format!(
+        "{}.mux.mp4",
+        video.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    ));
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.arg("-i").arg(video);
+    for t in tracks {
+        cmd.arg("-i").arg(t);
+    }
+    cmd.arg("-map").arg("0:v:0");
+    if tracks.len() == 1 {
+        cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
+    } else {
+        let graph = format!(
+            "[1:a][2:a]amix=inputs={}:duration=longest:normalize=0[mix];[mix]apad[a]",
+            tracks.len()
+        );
+        cmd.arg("-filter_complex").arg(graph);
+        cmd.arg("-map").arg("[a]");
+    }
+    cmd.arg("-c:v").arg("copy");
+    cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k").arg("-ar").arg("48000");
+    cmd.arg("-shortest").arg("-movflags").arg("+faststart");
+    cmd.arg(&tmp);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("调用 ffmpeg 封装音频失败: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    if std::fs::remove_file(video).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("替换成片失败：无法删除原文件".into());
+    }
+    std::fs::rename(&tmp, video).map_err(|e| format!("替换成片失败: {e}"))
+}
+
+fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> String {
     let s = &cfg.settings;
     format!(
         concat!(
@@ -99,9 +285,12 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64) -> String {
             "  \"speedResp\": {:.1},\n",
             "  \"followHz\": {:.3},\n",
             "  \"lookaheadMs\": {:.1},\n",
+            "  \"deadZone\": {:.4},\n",
+            "  \"cursorSmoothMs\": {:.1},\n",
             // duration/frames are recorded here so loaders never have to probe
             // the file with ffmpeg to find out how long the clip is
             "  \"duration\": {:.6},\n",
+            "  \"dropped\": {},\n",
             "  \"frames\": {}\n",
             "}}\n"
         ),
@@ -120,7 +309,10 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64) -> String {
         s.speed_resp,
         s.follow_hz,
         s.lookahead_ms,
+        s.dead_zone,
+        s.cursor_smooth_ms,
         duration,
+        dropped,
         frames
     )
 }
@@ -158,7 +350,11 @@ fn buttons() -> u32 {
 
 impl Recorder {
     pub fn start(cfg: RecorderConfig, ffmpeg: PathBuf) -> Result<Self, String> {
-        let cap = Capture::open(cfg.mon)?;
+        let cap = if cfg.synthetic {
+            Capture::open_synthetic(cfg.mon)?
+        } else {
+            Capture::open(cfg.mon)?
+        };
 
         let out_dir = cfg.out_root.join(format!("rec_{}", now_stamp()));
         std::fs::create_dir_all(&out_dir)
@@ -225,6 +421,20 @@ fn run(
     let out_w = (s.out_width & !1).max(16);
     let out_h = s.out_height().max(16);
     let mon = cfg.mon;
+    {
+        // Say it out loud: on a small screen the requested zoom is not what the
+        // take will actually show, and that is invisible until playback.
+        let (rw, rh) = crate::camera::requested_viewport(&s);
+        let (aw, ah, limited) = crate::camera::fit_viewport(&s, mon);
+        if limited {
+            crate::mc_warn!(
+                "camera",
+                "屏幕 {}x{} 放不下 {:.0}x{:.0} 的视口，实际限制为 {:.0}x{:.0}（有效缩放 {:.2}×）",
+                mon.w, mon.h, rw, rh, aw, ah,
+                s.out_width as f32 / aw.max(1.0)
+            );
+        }
+    }
 
     let mut master = if cfg.record_master {
         Some(
@@ -254,6 +464,11 @@ fn run(
     )
     .map_err(|e| format!("camera 编码器启动失败: {e}"))?;
 
+    // Started together with the clock, once the encoders are warm: the two
+    // pre-roll frames are not part of the timeline, so audio started earlier
+    // would sit a couple of hundred milliseconds ahead of the picture.
+    let mut audio: Option<crate::audio::AudioSession> = None;
+
     let track_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -270,75 +485,91 @@ fn run(
 
     // One clock for the camera thread, the trace and the encoded timeline, so
     // `track.csv` t=0 is frame 0 of the video and the offline bake lines up.
-    let t0_shared = Instant::now();
+    //
+    // It starts only once the first frame has actually reached both encoders:
+    // the first write costs a couple of hundred milliseconds while ffmpeg fills
+    // its pipe, and a clock started before that has to duplicate frames to stay
+    // in sync with the wall clock - which freezes the opening of every take.
+    let mut t0_shared = Instant::now();
     let shared = Arc::new(std::sync::Mutex::new(CamShared {
-        pos: cursor_pos(),
+        pos: read_cursor(&cfg.cursor, mon, 0.0),
         snap: Default::default(),
         btn: 0,
         ticks: 1, // the seed tick
     }));
 
+    // Seed the framing so frame 0 already has a sensible rectangle.
     {
+        let mut cam = Camera::new();
+        cam.set_screen(mon);
+        let start_pos = read_cursor(&cfg.cursor, mon, 0.0);
+        cam.reset(start_pos);
+        cam.tick(&s, start_pos, 1.0 / CAM_HZ);
+        let mut g = shared.lock().unwrap();
+        g.pos = start_pos;
+        g.snap = cam.snapshot();
+    }
+
+    // Spawned lazily, together with the clock, so the trace and the video share
+    // their origin no matter how long the encoders take to warm up.
+    let mut spawn_camera: Option<Box<dyn FnOnce(Instant) + Send>> = {
         let shared = shared.clone();
         let s2 = s.clone();
         let stop2 = stop.clone();
-        let t0_cam = t0_shared;
-        let mut cam = Camera::new();
-        cam.set_screen(mon);
-        let start_pos = cursor_pos();
-        cam.reset(start_pos);
-        cam.tick(&s2, start_pos, 1.0 / CAM_HZ);
-        {
-            let mut g = shared.lock().unwrap();
-            g.pos = start_pos;
-            g.snap = cam.snapshot();
-        }
+        let cursor = cfg.cursor.clone();
+        Some(Box::new(move |t0_cam: Instant| {
+                let cursor_src = cursor.clone();
+            let spawned = std::thread::Builder::new()
+                .name("mc-camera".into())
+                .spawn(move || {
+                    let mut cam = Camera::new();
+                    cam.set_screen(mon);
+                    cam.reset(read_cursor(&cursor_src, mon, 0.0));
+                    let step = 1.0 / CAM_HZ;
+                    let mut next = t0_cam + Duration::from_secs_f64(step);
+                    let mut t_prev = 0.0f64;
+                    let mut ticks: u64 = 1;
+                    while !stop2.load(Ordering::Relaxed) {
+                        let t = t0_cam.elapsed().as_secs_f64();
+                        let pos = read_cursor(&cursor_src, mon, t);
+                        let btn = buttons();
+                        // real interval, not the nominal step: the bake replays
+                        // these exact timestamps, so both must integrate the same dt
+                        let mut dt = t - t_prev;
+                        if dt < 1.0 / 1000.0 {
+                            dt = 1.0 / 1000.0;
+                        }
+                        if dt > 1.0 / 25.0 {
+                            dt = 1.0 / 25.0;
+                        }
+                        cam.tick(&s2, pos, dt);
+                        t_prev = t;
+                        ticks += 1;
+                        let snap = cam.snapshot();
+                        {
+                            let mut g = shared.lock().unwrap();
+                            g.pos = pos;
+                            g.snap = snap;
+                            g.btn = btn;
+                            g.ticks = ticks;
+                        }
+                        let _ = writeln!(track, "{:.5},{},{},{}", t, pos.x as i32, pos.y as i32, btn);
 
-        std::thread::Builder::new()
-            .name("mc-camera".into())
-            .spawn(move || {
-                let step = 1.0 / CAM_HZ;
-                let mut next = t0_cam + Duration::from_secs_f64(step);
-                let mut t_prev = 0.0f64;
-                let mut ticks: u64 = 1;
-                while !stop2.load(Ordering::Relaxed) {
-                    let t = t0_cam.elapsed().as_secs_f64();
-                    let pos = cursor_pos();
-                    let btn = buttons();
-                    // real interval, not the nominal step: the bake replays these
-                    // exact timestamps, so both must integrate with the same dt
-                    let mut dt = t - t_prev;
-                    if dt < 1.0 / 1000.0 {
-                        dt = 1.0 / 1000.0;
+                        let now = Instant::now();
+                        if now < next {
+                            std::thread::sleep(next - now);
+                        }
+                        next += Duration::from_secs_f64(step);
+                        if Instant::now() > next + Duration::from_millis(100) {
+                            next = Instant::now();
+                        }
                     }
-                    if dt > 1.0 / 25.0 {
-                        dt = 1.0 / 25.0;
-                    }
-                    cam.tick(&s2, pos, dt);
-                    t_prev = t;
-                    ticks += 1;
-                    let snap = cam.snapshot();
-                    {
-                        let mut g = shared.lock().unwrap();
-                        g.pos = pos;
-                        g.snap = snap;
-                        g.btn = btn;
-                        g.ticks = ticks;
-                    }
-                    let _ = writeln!(track, "{:.5},{},{},{}", t, pos.x as i32, pos.y as i32, btn);
-
-                    let now = Instant::now();
-                    if now < next {
-                        std::thread::sleep(next - now);
-                    }
-                    next += Duration::from_secs_f64(step);
-                    if Instant::now() > next + Duration::from_millis(100) {
-                        next = Instant::now();
-                    }
-                }
-            })
-            .map_err(|e| format!("启动相机线程失败: {e}"))?;
-    }
+                });
+            if let Err(e) = spawned {
+                crate::mc_error!("rec", "启动相机线程失败: {e}");
+            }
+        }))
+    };
 
     let mut frame_buf = vec![0u32; (mon.w * mon.h) as usize];
     let mut crop_buf = vec![0u32; (out_w * out_h) as usize];
@@ -357,9 +588,9 @@ fn run(
     );
     let _ = writeln!(frames_csv, "# frame,camera_tick,cx,cy,w,h");
 
-    let start = t0_shared;
+    let mut clock_started = false;
     let frame_dur = 1.0 / fps as f64;
-    let mut next = start + Duration::from_secs_f64(frame_dur);
+    let mut next = Instant::now();
     let mut emitted: i64 = 0;
     let mut written: i64 = 0;
     let mut written_pub: i64 = 0;
@@ -372,8 +603,10 @@ fn run(
         }
     }
     let mut dropped = 0u32;
+    let mut dropped_total = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
+        let frame_t0 = Instant::now();
         if !cap.grab(&mut frame_buf) {
             dropped += 1;
             if dropped > 120 {
@@ -382,18 +615,46 @@ fn run(
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
+        dropped_total += dropped;
         dropped = 0;
+        let mut stage_grab = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0;
+        let mut stage_resample = 0.0f32;
+        let mut stage_master = 0.0f32;
+        let mut stage_draw = 0.0f32;
+        let mut stage_camera = 0.0f32;
 
         let (pos, snap, ticks) = {
             let g = shared.lock().unwrap();
             (g.pos, g.snap, g.ticks)
         };
 
+        // Desktop Duplication never includes the pointer, so the master take has
+        // to have it painted in. The pixels underneath are saved first and put
+        // back after the write: the follow camera crops from a clean frame and
+        // draws its own sprite, kept crisp and at a constant apparent size.
+        let mut under: Option<(i32, i32, i32, i32, Vec<u32>)> = None;
+        if master.is_some() {
+            if let Some(spr) = sprites.get() {
+            let cx = pos.x - mon.x as f32;
+            let cy = pos.y - mon.y as f32;
+            let (bx, by, bw, bh) = crate::cursor::sprite_bounds(cx, cy, 1.0, spr, mon.w, mon.h);
+            if bw > 0 && bh > 0 {
+                let saved = copy_rect(&frame_buf, mon.w, bx, by, bw, bh);
+                draw(&mut frame_buf, mon.w, mon.h, cx, cy, 1.0, spr);
+                under = Some((bx, by, bw, bh, saved));
+            }
+            }
+        }
+
         if let Some(m) = master.as_mut() {
             if let Err(e) = m.write_frame(&frame_buf) {
                 write_err = Some(format!("写入原片失败: {e}"));
                 break;
             }
+        stage_master = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0 - stage_grab;
+        }
+        if let Some((bx, by, bw, bh, saved)) = under.take() {
+            paste_rect(&mut frame_buf, mon.w, bx, by, bw, bh, &saved);
         }
 
         let mut r = rect_from_snapshot(&snap, mon);
@@ -419,6 +680,7 @@ fn run(
             );
             rs.prep(lx as f32, ly as f32, r.w as f32, r.h as f32, out_w, out_h);
             rs.run(&frame_buf, mon.w, mon.h, &mut crop_buf, out_w);
+            stage_resample = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0 - stage_grab - stage_master;
 
             if let Some(spr) = sprites.get() {
                 let sc = out_w as f32 / r.w as f32;
@@ -437,10 +699,12 @@ fn run(
                     spr,
                 );
             }
+            stage_draw = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0 - stage_grab - stage_master - stage_resample;
             if let Err(e) = camera.write_frame(&crop_buf) {
                 write_err = Some(format!("写入跟拍成片失败: {e}"));
                 break;
             }
+            stage_camera = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0 - stage_grab - stage_master - stage_resample - stage_draw;
 
             // ---- live preview (every 3rd frame ≈ 10 Hz)
             if let Some(sink) = &cfg.preview {
@@ -464,12 +728,53 @@ fn run(
             }
         }
 
+        // Frame 0 has now reached both encoders: the warm-up is behind us, so
+        // this is where the timeline and the camera trace really begin.
+        // Two frames, not one: the *second* pipe write is the expensive one, so a
+        // clock started after frame 0 still has to duplicate a handful of frames.
+        if !clock_started && written >= 1 {
+            clock_started = true;
+            t0_shared = Instant::now();
+            next = t0_shared + Duration::from_secs_f64(frame_dur);
+            if let Some(spawn) = spawn_camera.take() {
+                spawn(t0_shared);
+            }
+            audio = crate::audio::start(out_dir, cfg.audio_system, cfg.audio_mic);
+            crate::mc_info!("rec", "计时从首帧写出后开始");
+        }
+
         let _ = writeln!(frames_csv, "{},{},{:.3},{:.3},{:.3},{:.3}", written, ticks, snap.center.x, snap.center.y, snap.src_w, snap.src_h);
+        if let Some(sink) = &cfg.debug {
+            if let Ok(mut d) = sink.lock() {
+                d.frames = written;
+                d.dropped = dropped_total;
+                let ms = frame_t0.elapsed().as_secs_f64() as f32 * 1000.0;
+                d.last_ms = ms;
+                d.recent.push_back(ms);
+                while d.recent.len() > 120 {
+                    d.recent.pop_front();
+                }
+                let mut v: Vec<f32> = d.recent.iter().copied().collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                if !v.is_empty() {
+                    d.p95_ms = v[((v.len() as f32 * 0.95) as usize).min(v.len() - 1)];
+                }
+                d.grab_ms = stage_grab;
+                d.master_ms = stage_master;
+        d.resample_ms = stage_resample;
+        d.write_ms = stage_draw;
+                    d.camera_ms = stage_camera;
+        d.expand = snap.expand;
+                d.speed = snap.speed;
+                d.center = [snap.center.x, snap.center.y];
+                d.src = [snap.src_w, snap.src_h];
+            }
+        }
         emitted += 1;
         written += 1;
 
         // CFR: duplicate until the frame count matches the wall clock
-        let ideal = (start.elapsed().as_secs_f64() * fps as f64).floor() as i64;
+        let ideal = (t0_shared.elapsed().as_secs_f64() * fps as f64).floor() as i64;
         // A slept/timed-out loop must not try to catch up hours of frames: cap
         // the burst at two seconds and let the timeline record the gap.
         let catch_up_cap = emitted + (fps as i64) * 2;
@@ -511,13 +816,42 @@ fn run(
     }
 
     crate::hud::set_rect(None, "");
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = t0_shared.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed); // camera thread
     std::thread::sleep(Duration::from_millis(20));
     drop(frames_csv);
 
     let master_code = master.map(|m| m.finish()).unwrap_or(0);
     let code = camera.finish();
+
+    // Audio is folded in after the encoders have closed their files, so a
+    // failed mux leaves a perfectly good silent video rather than a broken one.
+    let audio_files = match audio {
+        Some(session) => session.stop(),
+        None => Vec::new(),
+    };
+    let usable: Vec<std::path::PathBuf> = audio_files
+        .iter()
+        .filter(|f| f.usable())
+        .map(|f| f.path.clone())
+        .collect();
+    for f in audio_files.iter().filter(|f| !f.usable()) {
+        if let Some(e) = &f.error {
+            crate::mc_warn!("audio", "{} 没有可用音频: {e}", f.path.display());
+        }
+    }
+    if !usable.is_empty() {
+        let ff = ffmpeg.clone();
+        for name in ["master.mp4", "camera.mp4"] {
+            let video = out_dir.join(name);
+            match mux_audio(&ff, &video, &usable) {
+                Ok(()) => crate::mc_info!("audio", "{name} 已加入 {} 条音轨", usable.len()),
+                Err(e) => {
+                    crate::mc_warn!("audio", "{name} 封装音频失败: {e}");
+                }
+            }
+        }
+    }
 
     let mut failure = write_err;
     if failure.is_none() && master_code != 0 {
@@ -529,7 +863,7 @@ fn run(
 
     // Written either way: a folder without meta.json is invisible in the
     // library, so a failed take would silently vanish and be unrecoverable.
-    let mut meta = meta_json(&cfg, elapsed, written);
+    let mut meta = meta_json(&cfg, elapsed, written, dropped_total);
     if failure.is_some() {
         meta = meta.replacen("  \"frames\":", "  \"complete\": false,\n  \"frames\":", 1);
     }
@@ -549,7 +883,7 @@ fn run(
 }
 
 /// Free space on the volume that holds `path`, in MB.
-fn free_space_mb(path: &std::path::Path) -> Option<u64> {
+pub fn free_space_mb(path: &std::path::Path) -> Option<u64> {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let mut free = 0u64;

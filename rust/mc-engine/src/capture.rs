@@ -27,6 +27,8 @@ use windows::Win32::Graphics::Gdi::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapturePath {
+    /// Generated frames: no desktop involved, used for headless tests
+    Synthetic,
     /// GPU duplication: ~2-5 ms at 1440p
     Duplication,
     /// GDI fallback: 25-40 ms at 1440p, used in RDP / VMs / when another
@@ -400,11 +402,94 @@ pub struct Capture {
     mon: IRect,
     dda: Option<Dda>,
     blt: Option<BitbltCap>,
+    synthetic: Option<Synthetic>,
     pub path: CapturePath,
     pub fails: u32,
 }
 
+/// Renders a frame instead of reading the desktop.
+///
+/// This exists so a recording can run headless: the timing, the camera and the
+/// encoders are all exercised without touching the user's screen or pointer, and
+/// the picture is deterministic enough to assert on.
+struct Synthetic {
+    frame: u64,
+}
+
+impl Synthetic {
+    fn render(&mut self, dst: &mut [u32], w: i32, h: i32) {
+        self.frame += 1;
+        let t = self.frame as f32;
+        let bg = 0xFF2C_2420u32; // BGRA: dark slate
+        for p in dst.iter_mut() {
+            *p = bg;
+        }
+
+        // grid, scrolled by time so a moving picture is obvious in a still
+        let scroll = (t * 3.0) as i32;
+        for x in 0..w {
+            if (x + scroll).rem_euclid(64) == 0 {
+                let major = (x + scroll).rem_euclid(256) == 0;
+                let c = if major { 0xFF6E_5C50 } else { 0xFF46_3A32 };
+                for y in 0..h {
+                    dst[(y * w + x) as usize] = c;
+                }
+            }
+        }
+        for y in 0..h {
+            if (y + scroll).rem_euclid(64) == 0 {
+                let major = (y + scroll).rem_euclid(256) == 0;
+                let c = if major { 0xFF6E_5C50 } else { 0xFF46_3A32 };
+                for x in 0..w {
+                    dst[(y * w + x) as usize] = c;
+                }
+            }
+        }
+
+        // a block whose position encodes the frame number: two consecutive frames
+        // can never look alike, which is how a stalled pipeline shows up in tests
+        let bw = 48;
+        let bx = ((t * 9.0) as i32).rem_euclid((w - bw).max(1));
+        let by = (h / 2 - bw / 2).clamp(0, (h - bw).max(1));
+        for y in by..(by + bw).min(h) {
+            for x in bx..(bx + bw).min(w) {
+                dst[(y * w + x) as usize] = 0xFFC8_00FF; // magenta-ish
+            }
+        }
+
+        // white frame border
+        for x in 0..w {
+            dst[x as usize] = 0xFFF0_F0F0;
+            dst[((h - 1) * w + x) as usize] = 0xFFF0_F0F0;
+        }
+        for y in 0..h {
+            dst[(y * w) as usize] = 0xFFF0_F0F0;
+            dst[(y * w + w - 1) as usize] = 0xFFF0_F0F0;
+        }
+    }
+}
+
 impl Capture {
+    /// A capturer that generates its own frames. Nothing on the machine is read.
+    pub fn open_synthetic(mon: IRect) -> Result<Self, String> {
+        if mon.w <= 0 || mon.h <= 0 {
+            return Err("显示器矩形无效".into());
+        }
+        Ok(Self {
+            mon,
+            dda: None,
+            blt: None,
+            synthetic: Some(Synthetic { frame: 0 }),
+            path: CapturePath::Synthetic,
+            fails: 0,
+        })
+    }
+
+    /// True when this capturer is feeding generated frames.
+    pub fn is_synthetic(&self) -> bool {
+        self.synthetic.is_some()
+    }
+
     /// Tries GPU duplication first, falls back to GDI.
     pub fn open(mon: IRect) -> Result<Self, String> {
         if mon.w <= 0 || mon.h <= 0 {
@@ -415,6 +500,7 @@ impl Capture {
                 mon,
                 dda: Some(dda),
                 blt: None,
+                synthetic: None,
                 path: CapturePath::Duplication,
                 fails: 0,
             }
@@ -423,6 +509,7 @@ impl Capture {
                 mon,
                 dda: None,
                 blt: Some(blt),
+                synthetic: None,
                 path: CapturePath::BitBlt,
                 fails: 0,
             }
@@ -474,6 +561,13 @@ impl Capture {
 
     /// Fills `dst` (monitor sized, top-down BGRA).
     pub fn grab(&mut self, dst: &mut [u32]) -> bool {
+        if let Some(syn) = self.synthetic.as_mut() {
+            if dst.len() < (self.mon.w * self.mon.h) as usize {
+                return false;
+            }
+            syn.render(dst, self.mon.w, self.mon.h);
+            return true;
+        }
         let w = self.mon.w;
         let h = self.mon.h;
         let mon = self.mon;

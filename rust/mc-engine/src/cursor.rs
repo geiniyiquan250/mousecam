@@ -157,7 +157,86 @@ pub fn current_sprite() -> Option<Sprite> {
     }
 }
 
+/// A click emphasis: a ring that expands and fades from the press point.
+///
+/// `age` runs 0 (pressed) to 1 (gone). Screen recordings of a UI live or die on
+/// the viewer seeing where the click landed, and the pointer alone is easy to
+/// miss at 1080p.
+pub fn draw_click_ring(dst: &mut [u32], dw: i32, dh: i32, cx: f32, cy: f32, age: f32, scale: f32) {
+    if !(0.0..=1.0).contains(&age) || dw <= 0 || dh <= 0 {
+        return;
+    }
+    let ease = 1.0 - (1.0 - age).powf(2.6);
+    let radius = (9.0 + 25.0 * ease) * scale.max(0.05);
+    let thick = (2.6 + 1.6 * (1.0 - age)) * scale.max(0.05);
+    let alpha = (1.0 - age).powf(1.7) * 0.92;
+    if alpha <= 0.004 {
+        return;
+    }
+    let half = thick * 0.5 + 1.0;
+    let lim = radius + half + 1.0;
+    let x0 = ((cx - lim).floor() as i32).max(0);
+    let x1 = ((cx + lim).ceil() as i32).min(dw - 1);
+    let y0 = ((cy - lim).floor() as i32).max(0);
+    let y1 = ((cy + lim).ceil() as i32).min(dh - 1);
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let band = 1.0 - ((d - radius).abs() / half).min(1.0);
+            if band <= 0.0 {
+                continue;
+            }
+            let a = (alpha * band * band) as f32;
+            let i = (y * dw + x) as usize;
+            if i >= dst.len() {
+                continue;
+            }
+            let p = dst[i];
+            let (pr, pg, pb) = (
+                ((p >> 16) & 0xFF) as f32,
+                ((p >> 8) & 0xFF) as f32,
+                (p & 0xFF) as f32,
+            );
+            // a cool white reads on both light and dark UI
+            let (cr, cg, cb) = (232.0, 242.0, 255.0);
+            let r = (pr + (cr - pr) * a) as u32;
+            let g = (pg + (cg - pg) * a) as u32;
+            let b = (pb + (cb - pb) * a) as u32;
+            dst[i] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 /// Bilinear scaled alpha blend of the sprite into a BGRA frame.
+/// The frame rectangle a sprite will cover, clipped to the surface.
+///
+/// Used to save the pixels underneath before painting the pointer into the
+/// master take, so the follow camera still crops from a clean source.
+pub fn sprite_bounds(
+    cx: f32,
+    cy: f32,
+    scale: f32,
+    spr: &Sprite,
+    dw: i32,
+    dh: i32,
+) -> (i32, i32, i32, i32) {
+    let ox = cx - spr.hx * scale;
+    let oy = cy - spr.hy * scale;
+    let x0 = (ox.floor() as i32).max(0);
+    let y0 = (oy.floor() as i32).max(0);
+    let x1 = ((ox + spr.w as f32 * scale).ceil() as i32).min(dw);
+    let y1 = ((oy + spr.h as f32 * scale).ceil() as i32).min(dh);
+    if x1 <= x0 || y1 <= y0 {
+        return (0, 0, 0, 0);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
 pub fn draw(dst: &mut [u32], dw: i32, dh: i32, cx: f32, cy: f32, scale: f32, spr: &Sprite) {
     if spr.w <= 0 || spr.h <= 0 || scale <= 0.0 {
         return;
@@ -303,3 +382,8 @@ impl SpriteCache {
         }
     }
 }
+
+
+
+
+

@@ -4,10 +4,12 @@
 //! frame-by-frame: camera math, bilinear resampling, cursor compositing,
 //! the edit list and the offline renderer all match the reference build.
 
+pub mod audio;
 pub mod camera;
 pub mod capture;
 pub mod clip;
 pub mod log;
+pub mod probe;
 pub mod cursor;
 pub mod edit;
 pub mod ffmpeg;

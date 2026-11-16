@@ -26,6 +26,17 @@ pub struct Settings {
     pub speed_resp: f32,
     pub follow_hz: f32,
     pub lookahead_ms: f32,
+    /// Soft dead zone as a fraction of the resting viewport width. While the
+    /// pointer stays inside it the camera does not move at all, which is what
+    /// keeps a small circling gesture from swinging the whole frame.
+    pub dead_zone: f32,
+    /// Zero-phase smoothing applied to the pointer drawn into the export, in ms.
+    /// 0 draws the recorded positions untouched. The recording itself keeps the
+    /// raw track, so this is a look applied at render time and can be re-tuned on
+    /// a clip that has already been recorded.
+    pub cursor_smooth_ms: f32,
+    /// draw a ring that expands from each left click
+    pub click_ring: bool,
     pub clamp_to_screen: bool,
 }
 
@@ -42,6 +53,9 @@ impl Default for Settings {
             speed_resp: 35.0,
             follow_hz: 1.0,
             lookahead_ms: 60.0,
+            dead_zone: 0.07,
+            cursor_smooth_ms: 60.0,
+            click_ring: true,
             clamp_to_screen: true,
         }
     }

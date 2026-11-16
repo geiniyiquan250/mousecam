@@ -17,6 +17,12 @@ pub struct RenderOpts {
     pub aspect: i32,
     pub width: i32,
     pub fps: i32,
+    /// dead zone in percent of the viewport width; -1 keeps meta.json's value
+    pub dz: f32,
+    /// pointer smoothing in ms; -1 keeps meta.json's value
+    pub cs: f32,
+    /// click ring: -1 keeps meta.json's value, 0 off, 1 on
+    pub clk: i32,
 }
 
 impl Default for RenderOpts {
@@ -32,6 +38,9 @@ impl Default for RenderOpts {
             aspect: -1,
             width: -1,
             fps: -1,
+            dz: -1.0,
+            cs: -1.0,
+            clk: -1,
         }
     }
 }
@@ -67,6 +76,15 @@ impl RenderOpts {
         }
         if self.fps > 0 {
             s.fps = self.fps;
+        }
+        if self.dz >= 0.0 {
+            s.dead_zone = (self.dz / 100.0).clamp(0.0, 0.25);
+        }
+        if self.cs >= 0.0 {
+            s.cursor_smooth_ms = self.cs.clamp(0.0, 250.0);
+        }
+        if self.clk >= 0 {
+            s.click_ring = self.clk != 0;
         }
     }
 }
@@ -127,6 +145,9 @@ pub fn parse_edit(text: &str) -> EditList {
             "aspect" => e.cam.aspect = rest.parse().unwrap_or(e.cam.aspect),
             "width" => e.cam.width = rest.parse().unwrap_or(e.cam.width),
             "fps" => e.cam.fps = rest.parse().unwrap_or(e.cam.fps),
+            "dz" => e.cam.dz = rest.parse().unwrap_or(e.cam.dz),
+            "cs" => e.cam.cs = rest.parse().unwrap_or(e.cam.cs),
+            "clk" => e.cam.clk = rest.parse().unwrap_or(e.cam.clk),
             _ => {}
         }
     }
@@ -139,6 +160,23 @@ pub fn parse_edit(text: &str) -> EditList {
 }
 
 /// Where the camera should aim: manual keyframes win inside their span.
+/// Every left-button press in the track, as (time, x, y).
+///
+/// `btn` bit 0 is the left button, so a press is the sample where it goes from
+/// clear to set. Holding the button down does not produce more than one.
+pub fn click_points(track: &[TrackPt]) -> Vec<(f64, f32, f32)> {
+    let mut out = Vec::new();
+    let mut down = false;
+    for p in track {
+        let now = (p.btn & 1) != 0;
+        if now && !down {
+            out.push((p.t, p.x as f32, p.y as f32));
+        }
+        down = now;
+    }
+    out
+}
+
 pub fn cursor_at(track: &[TrackPt], edit: &EditList, t: f64) -> crate::camera::Vec2 {
     if edit.kf.len() >= 2 {
         let k = &edit.kf;

@@ -57,10 +57,43 @@ async fn record_start(
     edit: String,
     monitor: Option<i32>,
     hw: Option<bool>,
+    audio_system: Option<bool>,
+    audio_mic: Option<bool>,
+    synthetic: Option<bool>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || mc_api::record_start(edit, monitor, hw))
+    tauri::async_runtime::spawn_blocking(move || {
+        mc_api::record_start(edit, monitor, hw, audio_system, audio_mic, synthetic)
+    })
         .await
         .map_err(|e| format!("record_start thread: {e}"))?
+}
+
+#[tauri::command]
+async fn probe_clip(dir: String) -> Result<mc_api::ProbeDto, String> {
+    tauri::async_runtime::spawn_blocking(move || mc_api::probe_clip(dir))
+        .await
+        .map_err(|e| format!("probe thread: {e}"))?
+}
+
+#[tauri::command]
+async fn probe_latest() -> Result<mc_api::ProbeDto, String> {
+    tauri::async_runtime::spawn_blocking(mc_api::probe_latest)
+        .await
+        .map_err(|e| format!("probe thread: {e}"))?
+}
+
+#[tauri::command]
+async fn viewport_fit(edit: String, monitor: Option<i32>) -> mc_api::FitDto {
+    tauri::async_runtime::spawn_blocking(move || mc_api::viewport_fit(edit, monitor))
+        .await
+        .unwrap_or_else(|_| mc_api::viewport_fit(String::new(), None))
+}
+
+#[tauri::command]
+async fn debug_snapshot() -> mc_api::DebugSnapshot {
+    tauri::async_runtime::spawn_blocking(mc_api::debug_snapshot)
+        .await
+        .unwrap_or_else(|_| mc_api::debug_snapshot())
 }
 
 #[tauri::command]
@@ -164,7 +197,7 @@ async fn media_path(dir: String, which: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn app_settings() -> Result<(String, String, bool, bool, bool), String> {
+async fn app_settings() -> Result<(String, String, bool, bool, bool, bool, bool), String> {
     tauri::async_runtime::spawn_blocking(mc_api::app_settings)
         .await
         .map_err(|e| format!("app_settings thread: {e}"))
@@ -176,9 +209,11 @@ async fn set_app_settings(
     hw: bool,
     hud: bool,
     verbose: bool,
+    audio_system: bool,
+    audio_mic: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        mc_api::set_app_settings(captures_dir, hw, hud, verbose)
+        mc_api::set_app_settings(captures_dir, hw, hud, verbose, audio_system, audio_mic)
     })
         .await
         .map_err(|e| format!("set_app_settings thread: {e}"))?
@@ -493,6 +528,10 @@ fn main() {
             still,
             export,
             record_start,
+        probe_clip,
+        probe_latest,
+        debug_snapshot,
+        viewport_fit,
             record_stop,
             record_status,
             render_proxy,

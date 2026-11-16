@@ -39,6 +39,12 @@ pub fn bake_path(clip: &ClipInfo, s: &Settings, edit: &EditList) -> (Vec<CamFram
     // Replay the camera on the SAME tick grid the live recorder used: track.csv
     // is a 250 Hz log of every camera tick, so driving the bake from its
     // timestamps reproduces the recorded framing instead of approximating it.
+    // A take recorded while the encoders were still warming up has frames whose
+    // tick never advanced. Replaying those freezes the camera, which is what made
+    // the opening look like it ignored the cursor. When the grid is not strictly
+    // increasing anywhere, replay by time instead.
+    let ticks_ok = clip.frame_ticks.windows(2).all(|w| w[1] > w[0]);
+
     let mut k = 0usize;
     let mut t_prev = 0.0f64;
     let mut applied: u64 = 1; // the seed tick above
@@ -49,7 +55,7 @@ pub fn bake_path(clip: &ClipInfo, s: &Settings, edit: &EditList) -> (Vec<CamFram
         // Preferred path: replay exactly the ticks the recorder used for this
         // frame. The speed envelope is sensitive to tick phase, so matching the
         // count is what makes the export frame-identical to the live capture.
-        if let Some(&want) = clip.frame_ticks.get(i as usize) {
+        if let Some(&want) = clip.frame_ticks.get(i as usize).filter(|_| ticks_ok) {
             let want = want as u64;
             while applied < want && k < clip.track.len() {
                 let tk = clip.track[k].t;
@@ -177,6 +183,17 @@ pub fn render_clip(
     let mut writer = FrameWriter::open(ffmpeg, out, out_w, out_h, s.fps, fmt, crf)?;
 
     let sprite: Option<Sprite> = arrow_sprite();
+    // The pointer drawn into the take is a look, not the record: smoothing it
+    // here leaves track.csv and master.mp4 untouched, and lets an old clip be
+    // re-rendered with a steadier cursor without recording it again.
+    let draw_track = crate::track::smooth_track(&clip.track, s.cursor_smooth_ms);
+    let clicks = if s.click_ring {
+        crate::edit::click_points(&clip.track)
+    } else {
+        Vec::new()
+    };
+    // how long a ring lives, in seconds
+    const CLICK_SECS: f64 = 0.45;
 
     let mut frame_buf = vec![0u32; (clip.mon.w * clip.mon.h) as usize];
     let mut crop_buf = vec![0u32; (out_w * out_h) as usize];
@@ -225,8 +242,28 @@ pub fn render_clip(
         rs.prep(lx as f32, ly as f32, rw as f32, rh as f32, out_w, out_h);
         rs.run(&frame_buf, clip.mon.w, clip.mon.h, &mut crop_buf, out_w);
 
+        let now_t = target as f64 / s.fps as f64;
+        let sc_all = out_w as f32 / rw as f32;
+
+        // Rings go under the pointer so the arrow stays readable on top.
+        for &(ct, cx, cy) in &clicks {
+            let age = (now_t - ct) / CLICK_SECS;
+            if !(0.0..=1.0).contains(&age) {
+                continue;
+            }
+            crate::cursor::draw_click_ring(
+                &mut crop_buf,
+                out_w,
+                out_h,
+                (cx - r.x as f32) * sc_all,
+                (cy - r.y as f32) * sc_all,
+                age as f32,
+                sc_all,
+            );
+        }
+
         if let Some(spr) = &sprite {
-            let mpt: Vec2 = cursor_at(&clip.track, edit, target as f64 / s.fps as f64);
+            let mpt: Vec2 = cursor_at(&draw_track, edit, target as f64 / s.fps as f64);
             let sc = out_w as f32 / rw as f32;
             // same rule as the live recorder, taken from the baked rect so an
             // export matches what was on screen while recording

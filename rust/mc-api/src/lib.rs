@@ -169,6 +169,10 @@ pub struct AppSettings {
     pub hw_encode: bool,
     pub hud_default: bool,
     pub verbose: bool,
+    /// capture the desktop's own sound
+    pub audio_system: bool,
+    /// capture the microphone
+    pub audio_mic: bool,
 }
 
 fn settings_file() -> PathBuf {
@@ -198,6 +202,8 @@ pub fn settings() -> AppSettings {
         hud_default: true,
         // A debug build exists to be diagnosed, so log everything by default.
         verbose: cfg!(debug_assertions),
+        audio_system: false,
+        audio_mic: false,
     };
     if let Ok(txt) = std::fs::read_to_string(settings_file()) {
         for line in txt.lines() {
@@ -214,6 +220,8 @@ pub fn settings() -> AppSettings {
                 "hw" => out.hw_encode = v == "1" || v.eq_ignore_ascii_case("true"),
                 "hud" => out.hud_default = v == "1" || v.eq_ignore_ascii_case("true"),
                 "verbose" => out.verbose = v == "1" || v.eq_ignore_ascii_case("true"),
+                "audio_sys" => out.audio_system = v == "1" || v.eq_ignore_ascii_case("true"),
+                "audio_mic" => out.audio_mic = v == "1" || v.eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
@@ -222,18 +230,27 @@ pub fn settings() -> AppSettings {
     out
 }
 
-pub fn set_settings(captures_dir: String, hw: bool, hud: bool, verbose: bool) -> Result<(), String> {
+pub fn set_settings(
+    captures_dir: String,
+    hw: bool,
+    hud: bool,
+    verbose: bool,
+    audio_system: bool,
+    audio_mic: bool,
+) -> Result<(), String> {
     let dir = captures_dir.trim().to_string();
     let path = settings_file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
     }
     let body = format!(
-        "# MouseCam 设置\ncaptures={}\nhw={}\nhud={}\nverbose={}\n",
+        "# MouseCam 设置\ncaptures={}\nhw={}\nhud={}\nverbose={}\naudio_sys={}\naudio_mic={}\n",
         dir,
         if hw { 1 } else { 0 },
         if hud { 1 } else { 0 },
-        if verbose { 1 } else { 0 }
+        if verbose { 1 } else { 0 },
+        if audio_system { 1 } else { 0 },
+        if audio_mic { 1 } else { 0 }
     );
     std::fs::write(&path, body).map_err(|e| format!("写入配置失败: {e}"))?;
     *settings_cell().lock().unwrap() = None;
@@ -411,7 +428,7 @@ pub fn track_points(dir: String) -> Result<Vec<Vec<f32>>, String> {
         .track
         .iter()
         .step_by(step)
-        .map(|p| vec![p.t as f32, p.x as f32, p.y as f32])
+        .map(|p| vec![p.t as f32, p.x as f32, p.y as f32, p.btn as f32])
         .collect())
 }
 
@@ -524,7 +541,25 @@ pub fn still(dir: String, edit: String, frame: i32, max_w: u32, kind: String) ->
         rs.run(&src, dec_w, dec_h, &mut dst, out_w as i32);
 
         if let Some(spr) = arrow_sprite() {
-            let p = mc_engine::edit::cursor_at(&clip.track, &e, t);
+            let smooth = mc_engine::track::smooth_track(&clip.track, s.cursor_smooth_ms);
+            if s.click_ring {
+                for (ct, cx, cy) in mc_engine::edit::click_points(&clip.track) {
+                    let age = (t - ct) / 0.45;
+                    if (0.0..=1.0).contains(&age) {
+                        let sc2 = out_w as f32 / rw as f32;
+                        mc_engine::cursor::draw_click_ring(
+                            &mut dst,
+                            out_w as i32,
+                            out_h as i32,
+                            (cx - r.x as f32) * sc2,
+                            (cy - r.y as f32) * sc2,
+                            age as f32,
+                            sc2,
+                        );
+                    }
+                }
+            }
+            let p = mc_engine::edit::cursor_at(&smooth, &e, t);
             let sc = out_w as f32 / rw;
             draw_cursor(&mut dst, out_w as i32, out_h as i32, (p.x - r.x as f32) * sc, (p.y - r.y as f32) * sc, sc, &spr);
         }
@@ -581,6 +616,14 @@ pub fn export(
         crf,
         |_, _| {},
     )?;
+    // Show the result where it landed: exporting is the end of a long session
+    // and hunting for the file in a captures folder is pure friction.
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", sum.out_path.display()))
+            .spawn();
+    }
     Ok(format!(
         "{}  ({} 帧 / {:.1}s)",
         sum.out_path.display(),
@@ -599,6 +642,7 @@ struct Session {
     root: PathBuf,
     t0: Instant,
     sink: mc_engine::recorder::PreviewSink,
+    debug: mc_engine::recorder::DebugSink,
 }
 
 static SESSION: OnceLock<Mutex<Option<Session>>> = OnceLock::new();
@@ -618,10 +662,26 @@ pub fn record_start(
     edit: String,
     monitor: Option<i32>,
     hw: Option<bool>,
+    audio_system: Option<bool>,
+    audio_mic: Option<bool>,
+    synthetic: Option<bool>,
 ) -> Result<String, String> {
     // None means no explicit choice (the hotkey path): use the saved
     // preference, but only when this machine can encode in hardware.
     let hw = Some(hw.unwrap_or_else(|| settings().hw_encode && nvenc_available()));
+    // Headless mode: generated frames and a scripted pointer, so a recording can
+    // be exercised without touching the desktop somebody else is using. Debug
+    // builds only - a release build must keep reading the real screen.
+    let synthetic = synthetic.unwrap_or(false) && cfg!(debug_assertions);
+    if synthetic {
+        mc_engine::mc_warn!("record", "合成模式：不读取桌面，光标走脚本轨迹");
+    }
+    let (saved_sys, saved_mic) = audio_prefs();
+    let want_sys = audio_system.unwrap_or(saved_sys);
+    let want_mic = audio_mic.unwrap_or(saved_mic);
+    if want_sys || want_mic {
+        mc_engine::mc_info!("record", "audio: system={want_sys} mic={want_mic}");
+    }
     mc_engine::mc_info!("record", "start: monitor={:?} hw={:?}", monitor, hw);
     if session().lock().unwrap().is_some() {
         return Err("已经在录制".into());
@@ -650,6 +710,7 @@ pub fn record_start(
     };
 
     let sink = mc_engine::recorder::new_sink();
+    let debug = mc_engine::recorder::new_debug_sink();
     let cfg = mc_engine::RecorderConfig {
         mon,
         out_root: captures_root(),
@@ -659,18 +720,235 @@ pub fn record_start(
         quality: vq,
         camera_format: vfmt,
         camera_quality: vq + 4,
+        audio_system: want_sys,
+        audio_mic: want_mic,
         preview: Some(sink.clone()),
+        debug: Some(debug.clone()),
+        synthetic,
+        cursor: if synthetic {
+            mc_engine::recorder::CursorSource::Scripted
+        } else {
+            mc_engine::recorder::CursorSource::Real
+        },
     };
 
-    let rec = mc_engine::Recorder::start(cfg, ff)?;
+    // hide the framing overlay for the take, or it ends up in the video
+    HUD_WAS_ON.store(mc_engine::hud::enabled(), Ordering::Relaxed);
+    if HUD_WAS_ON.load(Ordering::Relaxed) {
+        mc_engine::mc_info!("record", "hud: hidden for the take");
+        mc_engine::hud::set_enabled(false);
+    }
+
+    let rec = match mc_engine::Recorder::start(cfg, ff) {
+        Ok(r) => r,
+        Err(e) => {
+            // nothing was recorded, so put the overlay back
+            if HUD_WAS_ON.load(Ordering::Relaxed) {
+                mc_engine::hud::set_enabled(true);
+            }
+            return Err(e);
+        }
+    };
     let root = rec.out_dir.clone();
     *session().lock().unwrap() = Some(Session {
         rec,
         root: root.clone(),
         t0: Instant::now(),
         sink,
+        debug,
     });
     Ok(root.display().to_string())
+}
+
+/// Whether the framing HUD was on before this take started.
+///
+/// The HUD cannot simply be left alone during a recording: DXGI Desktop
+/// Duplication ignores `WDA_EXCLUDEFROMCAPTURE`, so the frame would be baked
+/// into the video. It is switched off for the take and restored afterwards.
+static HUD_WAS_ON: AtomicBool = AtomicBool::new(false);
+
+/// The health report of one take, as JSON for the UI and for scripts.
+#[derive(Serialize)]
+pub struct ProbeDto {
+    pub dir: String,
+    pub good: bool,
+    pub frames: i64,
+    pub duplicates: i64,
+    pub leading_frozen_ms: f64,
+    pub stalled_frames: i64,
+    pub tick_regressions: i64,
+    pub duration: f64,
+    pub video_secs: f64,
+    pub audio_secs: f64,
+    pub dropped: u32,
+    pub clamped_frames: i64,
+    pub issues: Vec<String>,
+}
+
+fn to_dto(dir: &std::path::Path, p: mc_engine::probe::Probe) -> ProbeDto {
+    ProbeDto {
+        dir: dir.display().to_string(),
+        good: p.good(),
+        frames: p.frames,
+        duplicates: p.duplicates,
+        leading_frozen_ms: p.leading_frozen_ms,
+        stalled_frames: p.stalled_frames,
+        tick_regressions: p.tick_regressions,
+        duration: p.duration,
+        video_secs: p.video_secs,
+        audio_secs: p.audio_secs,
+        dropped: p.dropped,
+        clamped_frames: p.clamped_frames,
+        issues: p.issues,
+    }
+}
+
+/// Health report for one take.
+pub fn probe_clip(dir: String) -> Result<ProbeDto, String> {
+    let path = PathBuf::from(&dir);
+    let ff = find_ffmpeg();
+    let p = mc_engine::probe::probe(&path, ff.as_deref())?;
+    Ok(to_dto(&path, p))
+}
+
+/// Health report for the most recent take.
+pub fn probe_latest() -> Result<ProbeDto, String> {
+    let root = captures_root();
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() || !p.join("meta.json").exists() {
+                continue;
+            }
+            let Ok(md) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let Ok(stamp) = md.modified() else {
+                continue;
+            };
+            if best.as_ref().map(|(t, _)| stamp > *t).unwrap_or(true) {
+                best = Some((stamp, p));
+            }
+        }
+    }
+    let (_, dir) = best.ok_or_else(|| "还没有任何素材".to_string())?;
+    probe_clip(dir.display().to_string())
+}
+
+#[derive(Serialize)]
+pub struct CameraSnapDto {
+    pub expand: f32,
+    pub speed: f32,
+    pub center: [f32; 2],
+    pub src: [f32; 2],
+}
+
+/// Everything worth knowing about the running app in one call.
+#[derive(Serialize)]
+pub struct DebugSnapshot {
+    pub recording: bool,
+    pub dir: String,
+    pub elapsed: f64,
+    pub frames: i64,
+    pub dropped: u32,
+    pub last_frame_ms: f32,
+    pub p95_frame_ms: f32,
+    pub grab_ms: f32,
+    pub master_ms: f32,
+    pub resample_ms: f32,
+    pub camera_ms: f32,
+    pub write_ms: f32,
+    pub camera: CameraSnapDto,
+    pub captures_root: String,
+    pub disk_free_mb: Option<u64>,
+    pub hud: bool,
+    pub preview: bool,
+    pub monitors: Vec<MonitorDto>,
+    pub log: String,
+}
+
+pub fn debug_snapshot() -> DebugSnapshot {
+    let (recording, dir, elapsed, stats) = {
+        let g = session().lock().unwrap();
+        match g.as_ref() {
+            Some(s) => {
+                let st = s.debug.lock().map(|d| d.clone_stats()).unwrap_or_default();
+                (
+                    true,
+                    s.root.display().to_string(),
+                    s.t0.elapsed().as_secs_f64(),
+                    st,
+                )
+            }
+            None => (false, String::new(), 0.0, Default::default()),
+        }
+    };
+    let root = captures_root();
+    DebugSnapshot {
+        recording,
+        dir,
+        elapsed,
+        frames: stats.frames,
+        dropped: stats.dropped,
+        last_frame_ms: stats.last_ms,
+        p95_frame_ms: stats.p95_ms,
+        grab_ms: stats.grab_ms,
+        master_ms: stats.master_ms,
+        camera_ms: stats.camera_ms,
+        resample_ms: stats.resample_ms,
+        write_ms: stats.write_ms,
+        camera: CameraSnapDto {
+            expand: stats.expand,
+            speed: stats.speed,
+            center: stats.center,
+            src: stats.src,
+        },
+        disk_free_mb: mc_engine::recorder::free_space_mb(&root),
+        captures_root: root.display().to_string(),
+        hud: hud_get(),
+        preview: preview_active(),
+        monitors: list_monitors(),
+        log: mc_engine::log::path().display().to_string(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct FitDto {
+    pub requested: [f32; 2],
+    pub actual: [f32; 2],
+    pub limited: bool,
+    pub effective_zoom: f32,
+    pub monitor: [i32; 4],
+}
+
+/// What the viewport will really be on this monitor, so the UI can say "the
+/// screen is too small for this zoom" before a take is wasted.
+pub fn viewport_fit(edit: String, monitor: Option<i32>) -> FitDto {
+    let mut s = Settings::default();
+    parse_edit(&edit).cam.apply(&mut s);
+    let mons = list_monitors();
+    let idx = monitor.unwrap_or(0).max(0) as usize;
+    let m = mons.get(idx).or_else(|| mons.first());
+    let Some(m) = m else {
+        return FitDto {
+            requested: [0.0, 0.0],
+            actual: [0.0, 0.0],
+            limited: false,
+            effective_zoom: s.zoom,
+            monitor: [0; 4],
+        };
+    };
+    let (rw, rh) = mc_engine::camera::requested_viewport(&s);
+    let (aw, ah, limited) =
+        mc_engine::camera::fit_viewport(&s, mc_engine::camera::IRect::new(m.x, m.y, m.w, m.h));
+    FitDto {
+        requested: [rw, rh],
+        actual: [aw, ah],
+        limited,
+        effective_zoom: s.out_width as f32 / aw.max(1.0),
+        monitor: [m.x, m.y, m.w, m.h],
+    }
 }
 
 pub fn record_status() -> RecStatus {
@@ -701,6 +979,10 @@ pub fn record_stop() -> Result<String, String> {
     let s = sess.ok_or_else(|| "没有在录制".to_string())?;
     let dir = s.root.clone();
     let sum = s.rec.stop()?;
+    if HUD_WAS_ON.swap(false, Ordering::Relaxed) {
+        mc_engine::mc_info!("record", "hud: restored after the take");
+        mc_engine::hud::set_enabled(true);
+    }
     Ok(format!(
         "{}  ({} 帧 / {:.1}s)",
         dir.display(),
@@ -1162,7 +1444,7 @@ fn toggle_recording() {
         let _ = record_stop();
     } else {
         let (edit, mon, hw) = last_start().lock().unwrap().clone();
-        let _ = record_start(edit, mon, hw);
+        let _ = record_start(edit, mon, hw, None, None, None);
     }
 }
 
@@ -1234,7 +1516,14 @@ pub fn nvenc_available() -> bool {
 }
 
 /// (effective output dir, configured dir or "" for the default, hw, hud)
-pub fn app_settings() -> (String, String, bool, bool, bool) {
+/// The saved capture preferences: audio switches live here because they belong
+/// to the act of recording, not to how a clip is later framed.
+pub fn audio_prefs() -> (bool, bool) {
+    let st = settings();
+    (st.audio_system, st.audio_mic)
+}
+
+pub fn app_settings() -> (String, String, bool, bool, bool, bool, bool) {
     let st = settings();
     let effective = captures_root().display().to_string();
     (
@@ -1243,6 +1532,8 @@ pub fn app_settings() -> (String, String, bool, bool, bool) {
         st.hw_encode,
         st.hud_default,
         st.verbose,
+        st.audio_system,
+        st.audio_mic,
     )
 }
 
@@ -1251,6 +1542,8 @@ pub fn set_app_settings(
     hw: bool,
     hud: bool,
     verbose: bool,
+    audio_system: bool,
+    audio_mic: bool,
 ) -> Result<(), String> {
     // Saves used to succeed with an unusable folder, and the failure only showed
     // up later as "创建目录失败" when recording started. Refuse it here instead.
@@ -1262,7 +1555,7 @@ pub fn set_app_settings(
             return Err(format!("该文件夹不可写: {}", p.display()));
         }
     }
-    set_settings(captures_dir, hw, hud, verbose)
+    set_settings(captures_dir, hw, hud, verbose, audio_system, audio_mic)
         .map_err(|e| e)
         .inspect(|_| mc_engine::log::set_verbose(verbose))
 }

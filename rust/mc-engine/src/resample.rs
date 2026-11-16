@@ -122,17 +122,58 @@ impl Resampler {
         let maxx = (sw - 1).max(0);
         let maxy = (sh - 1).max(0);
 
-        for y in 0..dh {
-            let yu = y as usize;
+        // A 2560x1440 frame downscaled to 1080x608 is ~650k pixels of bilinear
+        // work per frame. Spreading the rows over a few cores keeps it out of the
+        // frame budget, which is what made the recorder miss 30 fps on the big
+        // monitor.
+        let rows = dh as usize;
+        let row_px = dstride.max(1) as usize;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4);
+        if threads > 1 && rows >= 64 && dst.len() >= rows * row_px {
+            let band = rows.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for (i, chunk) in dst.chunks_mut(band * row_px).enumerate() {
+                    let y0 = i * band;
+                    let y1 = (y0 + band).min(rows);
+                    if y0 >= y1 {
+                        break;
+                    }
+                    scope.spawn(move || {
+                        self.run_rows(y0, y1, src, sw, maxx, maxy, chunk, dstride);
+                    });
+                }
+            });
+            return;
+        }
+        self.run_rows(0, rows, src, sw, maxx, maxy, dst, dstride);
+    }
+
+    /// Bilinear pass for rows `y0..y1`; `dst` starts at row `y0`.
+    fn run_rows(
+        &self,
+        y0: usize,
+        y1: usize,
+        src: &[u32],
+        sw: i32,
+        maxx: i32,
+        maxy: i32,
+        dst: &mut [u32],
+        dstride: i32,
+    ) {
+        for y in y0..y1 {
+            let yu = y;
             let ya = self.y0[yu].clamp(0, maxy);
             let yb = self.y1[yu].clamp(0, maxy);
             let wa0 = self.wy0[yu];
             let wa1 = self.wy1[yu];
             let r0 = (ya * sw) as usize;
             let r1 = (yb * sw) as usize;
-            let drow = (y * dstride) as usize;
+            let drow = (y - y0) * dstride as usize;
 
-            for x in 0..dw {
+            for x in 0..self.dw {
                 let xu = x as usize;
                 let xa = self.x0[xu].clamp(0, maxx) as usize;
                 let xb = self.x1[xu].clamp(0, maxx) as usize;
@@ -144,11 +185,11 @@ impl Resampler {
                 let p01 = src[r1 + xa];
                 let p11 = src[r1 + xb];
 
-                let ch = |sh: u32| -> i32 {
-                    ((p00 >> sh) & 0xFF) as i32 * bx * wa0
-                        + ((p10 >> sh) & 0xFF) as i32 * by * wa0
-                        + ((p01 >> sh) & 0xFF) as i32 * bx * wa1
-                        + ((p11 >> sh) & 0xFF) as i32 * by * wa1
+                let ch = |shift: u32| -> i32 {
+                    ((p00 >> shift) & 0xFF) as i32 * bx * wa0
+                        + ((p10 >> shift) & 0xFF) as i32 * by * wa0
+                        + ((p01 >> shift) & 0xFF) as i32 * bx * wa1
+                        + ((p11 >> shift) & 0xFF) as i32 * by * wa1
                 };
 
                 let b = (ch(0) >> 16).clamp(0, 255) as u32;

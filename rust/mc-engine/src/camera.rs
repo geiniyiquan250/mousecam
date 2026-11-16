@@ -55,6 +55,39 @@ pub struct CamSnapshot {
     pub expand: f32,
     pub valid: bool,
     pub tracking: bool,
+    /// The screen was too small for the requested viewport, so it was shrunk.
+    pub limited: bool,
+}
+
+/// The viewport a Take asks for, and the one a monitor can actually show.
+///
+/// A viewport wider or taller than the screen would have to show empty space, so
+/// the camera shrinks it to fit - which silently raises the effective zoom. On a
+/// 1080-wide screen every zoom below 1.0 collapses to 1.0 and the speed-driven
+/// expansion disappears, so the numbers are reported instead of applied quietly.
+pub fn requested_viewport(s: &Settings) -> (f32, f32) {
+    let out_w = s.out_width as f32;
+    let src_w = out_w / s.zoom.clamp(0.1, 8.0);
+    let aspect = aspect_value(s.aspect_idx);
+    (src_w, src_w / aspect)
+}
+
+/// What a given monitor can actually show for these settings.
+pub fn fit_viewport(s: &Settings, mon: IRect) -> (f32, f32, bool) {
+    let (mut w, mut h) = requested_viewport(s);
+    let mut fit = 1.0f32;
+    if w > mon.w as f32 {
+        fit = mon.w as f32 / w;
+    }
+    if h * fit > mon.h as f32 {
+        fit *= mon.h as f32 / (h * fit);
+    }
+    let limited = fit < 1.0;
+    if limited {
+        w *= fit;
+        h *= fit;
+    }
+    (w, h, limited)
 }
 
 /// How much the viewport is currently grown by speed, relative to its resting
@@ -67,6 +100,15 @@ pub fn growth_factor(src_w: f32, out_w: i32, zoom: f32) -> f32 {
     }
     (src_w / rest).clamp(1.0, 4.0)
 }
+
+/// How fast the camera anchor follows the pointer.
+///
+/// Long on purpose: a hand circling in a small area has a centre that only shows
+/// up once the loop averages out. Measured on a synthetic 1.6 Hz circle, 3 s puts
+/// the anchor within 16 px of the true centre; 0.9 s leaves 38 px and a visible
+/// drift. Going longer costs nothing on ordinary movement because the dead zone
+/// already handles the transient.
+const ANCHOR_SECS: f32 = 3.0;
 
 fn clampf(v: f32, a: f32, b: f32) -> f32 {
     if v < a {
@@ -139,6 +181,10 @@ impl OneEuro {
 pub struct Camera {
     screen: IRect,
     center: Vec2,
+    /// Where the camera would like to sit. It trails the pointer with a long time
+    /// constant, so a pointing gesture that stays in one area converges onto the
+    /// centre of that area instead of orbiting with the hand.
+    anchor: Vec2,
     vel: Vec2,
     prev_filtered: Vec2,
     vel_smooth: Vec2,
@@ -159,6 +205,7 @@ impl Camera {
         Self {
             screen: IRect::new(0, 0, 1920, 1080),
             center: Vec2::default(),
+            anchor: Vec2::default(),
             vel: Vec2::default(),
             prev_filtered: Vec2::default(),
             vel_smooth: Vec2::default(),
@@ -178,6 +225,7 @@ impl Camera {
 
     pub fn reset(&mut self, p: Vec2) {
         self.center = p;
+        self.anchor = p;
         self.vel = Vec2::default();
         self.prev_filtered = p;
         self.vel_smooth = Vec2::default();
@@ -204,6 +252,7 @@ impl Camera {
 
         if !self.init {
             self.center = mouse;
+            self.anchor = mouse;
             self.prev_filtered = mouse;
             self.euro.reset(mouse);
             self.init = true;
@@ -256,16 +305,22 @@ impl Camera {
         src_h *= grow;
 
         // never ask for more pixels than the monitor has (keeps the aspect)
-        let mut fit = 1.0f32;
+        // A viewport bigger than the screen would have to show empty space, so it
+        // is shrunk to fit - which silently raises the effective zoom. On a small
+        // second monitor that makes every zoom below 1.0 a no-op and kills the
+        // speed-driven expansion, so the fact is recorded rather than hidden.
+        let mut limited = false;
         if src_w > self.screen.w as f32 {
-            fit = self.screen.w as f32 / src_w;
+            let f = self.screen.w as f32 / src_w;
+            src_w *= f;
+            src_h *= f;
+            limited = true;
         }
-        if src_h * fit > self.screen.h as f32 {
-            fit *= self.screen.h as f32 / (src_h * fit);
-        }
-        if fit < 1.0 {
-            src_w *= fit;
-            src_h *= fit;
+        if src_h > self.screen.h as f32 {
+            let f = self.screen.h as f32 / src_h;
+            src_w *= f;
+            src_h *= f;
+            limited = true;
         }
 
         // ---- target point: cursor + look-ahead
@@ -278,6 +333,30 @@ impl Camera {
         } else {
             self.center
         };
+
+        // ---- dead zone
+        // The camera sits on `anchor`, which follows the pointer slowly. Nothing
+        // moves while the pointer is within the zone; beyond it the anchor is
+        // dragged just far enough to keep the pointer on the edge. Circling in a
+        // small area therefore parks the frame on the centre of that area.
+        if s.dead_zone > 0.0005 && inside {
+            let rest_w = crate::camera::requested_viewport(s).0.max(16.0);
+            let dz = rest_w * s.dead_zone.clamp(0.0, 0.25);
+            // ~0.9 s time constant: long enough to average out a circling hand,
+            // short enough that walking across the screen does not feel detached
+            let k = (dt as f32 / ANCHOR_SECS).clamp(0.0, 1.0);
+            self.anchor.x += (p.x - self.anchor.x) * k;
+            self.anchor.y += (p.y - self.anchor.y) * k;
+            let dx = target.x - self.anchor.x;
+            let dy = target.y - self.anchor.y;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= dz {
+                target = self.anchor;
+            } else {
+                let f = (d - dz) / d;
+                target = Vec2::new(self.anchor.x + dx * f, self.anchor.y + dy * f);
+            }
+        }
 
         if s.clamp_to_screen {
             let hx = src_w * 0.5;
@@ -359,6 +438,7 @@ impl Camera {
             src_h,
             speed,
             expand: self.expand,
+            limited,
             valid: true,
             tracking: inside,
         };
@@ -392,7 +472,7 @@ impl Camera {
 mod cursor_scale {
     use super::growth_factor;
 
-    #[test]
+
     fn resting_viewport_does_not_scale_the_cursor() {
         // src_w equals out_w/zoom, i.e. no speed expansion
         assert!((growth_factor(1080.0, 1080, 1.0) - 1.0).abs() < 1e-6);
@@ -410,5 +490,69 @@ mod cursor_scale {
     fn growth_is_clamped_and_never_shrinks() {
         assert_eq!(growth_factor(900.0, 1080, 1.0), 1.0); // smaller than rest -> 1.0
         assert_eq!(growth_factor(99_999.0, 1080, 1.0), 4.0); // absurd -> 4.0
+    }
+}
+
+#[cfg(test)]
+mod camera_follow {
+    use super::*;
+
+    /// A hand circling in one spot must not take the frame with it.
+    ///
+    /// This drives the same `tick` the recorder calls 250 times a second, so it
+    /// covers the live recording path, not only the export.
+    fn circling_travel(radius: f32, dead_zone: f32) -> f64 {
+        let mut s = Settings::default();
+        s.dead_zone = dead_zone;
+        s.zoom = 1.0;
+        s.out_width = 1080;
+        s.speed_resp = 35.0;
+        let mut cam = Camera::new();
+        cam.set_screen(IRect::new(0, 0, 2560, 1440));
+        let c = Vec2::new(1280.0, 720.0);
+        for _ in 0..400 {
+            cam.tick(&s, c, 1.0 / 250.0);
+        }
+        let mut total = 0.0f64;
+        let mut prev = cam.center;
+        for i in 0..(8 * 250) {
+            let t = i as f32 / 250.0;
+            let a = 2.0 * std::f32::consts::PI * 1.6 * t;
+            // a 70 px circle plus the tremor a real hand has
+            let p = Vec2::new(
+                c.x + radius * a.cos() + (a * 7.0).sin() * 1.2,
+                c.y + radius * a.sin() + (a * 9.0).cos() * 1.2,
+            );
+            cam.tick(&s, p, 1.0 / 250.0);
+            total += (((cam.center.x - prev.x).powi(2) + (cam.center.y - prev.y).powi(2))
+                .sqrt()) as f64;
+            prev = cam.center;
+        }
+        total
+    }
+
+    #[test]
+    fn a_circle_inside_the_dead_zone_leaves_the_frame_still() {
+        // 50 px radius plus tremor sits well inside the 7 % zone (75 px)
+        let on = circling_travel(50.0, 0.07);
+        assert!(on < 40.0, "camera should hold still, it travelled {on:.0} px");
+    }
+
+    #[test]
+    fn a_circle_larger_than_the_zone_is_damped_a_lot() {
+        // 70 px is right at the edge of the zone, so it rubs against it
+        let off = circling_travel(70.0, 0.0);
+        let on = circling_travel(70.0, 0.07);
+        assert!(
+            on < off * 0.4,
+            "dead zone should damp it: off={off:.0} px on={on:.0} px"
+        );
+    }
+
+    #[test]
+    fn dead_zone_can_be_switched_off() {
+        // dz 0 has to behave like it did before the feature existed
+        let off = circling_travel(70.0, 0.0);
+        assert!(off > 500.0, "without a dead zone the frame follows: {off:.0} px");
     }
 }

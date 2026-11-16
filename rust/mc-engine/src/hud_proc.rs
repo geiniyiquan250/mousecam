@@ -49,6 +49,9 @@ struct Frame {
 struct View {
     enabled: bool,
     frame: Option<Frame>,
+    /// The screen being recorded, so the frame can stop at its edge instead of
+    /// spilling onto the display next to it.
+    monitor: Option<(i32, i32, i32, i32)>,
     label: String,
     cfg: HudConfig,
 }
@@ -64,6 +67,7 @@ static VIEW: OnceLock<Mutex<View>> = OnceLock::new();
 fn view() -> &'static Mutex<View> {
     VIEW.get_or_init(|| {
         Mutex::new(View {
+            monitor: None,
             enabled: true,
             frame: None,
             label: String::new(),
@@ -89,6 +93,7 @@ fn apply(line: &str) -> bool {
             let n: Vec<i32> = rest.iter().filter_map(|v| v.parse().ok()).collect();
             if n.len() >= 8 {
                 let mut v = view().lock().unwrap();
+                v.monitor = Some((n[4], n[5], n[6], n[7]));
                 v.frame = Some(Frame {
                     x: n[0], y: n[1], w: n[2], h: n[3],
                     mon_x: n[4], mon_y: n[5], mon_w: n[6], mon_h: n[7],
@@ -244,8 +249,35 @@ unsafe fn repaint(hwnd: HWND) {
     }
 
     let pad = v.cfg.thickness.clamp(1, 8) + 2;
-    let need_w = f.w + pad * 2;
-    let need_h = f.h + pad * 2;
+
+    // The border is drawn just outside the viewport. At a screen edge that puts it
+    // a few pixels onto the neighbouring display, so pull the framed rect inward:
+    // the outline then sits just inside the monitor, overlapping a little content,
+    // instead of spilling onto the screen next door.
+    let (mut fx, mut fy, mut fw, mut fh) = (f.x, f.y, f.w, f.h);
+    if let Some((mx, my, mw, mh)) = v.monitor {
+        if fx - pad < mx {
+            let d = mx - (fx - pad);
+            fx += d;
+            fw -= d;
+        }
+        if fy - pad < my {
+            let d = my - (fy - pad);
+            fy += d;
+            fh -= d;
+        }
+        if fx + fw + pad > mx + mw {
+            fw = mx + mw - pad - fx;
+        }
+        if fy + fh + pad > my + mh {
+            fh = my + mh - pad - fy;
+        }
+        fw = fw.max(16);
+        fh = fh.max(16);
+    }
+
+    let need_w = fw + pad * 2;
+    let need_h = fh + pad * 2;
     let (ww, wh) = (need_w.max(16), need_h.max(16));
 
     PAINTER.with(|cell| {
@@ -257,7 +289,9 @@ unsafe fn repaint(hwnd: HWND) {
         let Some(s) = p.surface.as_mut() else {
             return;
         };
-        if paint(hwnd, s, f.x - pad, f.y - pad, &v.label, v.cfg, Some((pad, pad, f.w, f.h))) {
+        let wx = fx - pad;
+        let wy = fy - pad;
+        if paint(hwnd, s, wx, wy, &v.label, v.cfg, Some((pad, pad, fw, fh))) {
             p.last = Some(v);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);

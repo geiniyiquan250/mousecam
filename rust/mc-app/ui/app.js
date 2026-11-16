@@ -77,6 +77,11 @@ const state = {
   playing: false,
   playing_rafs: 0,
   zoom: 0,
+  tlPan: null,          // left edge in seconds once the user pans by hand
+  dragHint: null,       // {t} while a trim handle is being dragged
+  clicks: [],           // times of left-button presses, for snapping
+  undoStack: [],
+  redoStack: [],
   edit: {
     zoom: 1.0,
     expand: 1.2,
@@ -85,6 +90,9 @@ const state = {
     resp: 35,
     follow: 1.0,
     look: 60,
+    dz: 7,
+    cs: 60,
+    clk: 1,
     aspect: 0,
     width: 1080,
   },
@@ -174,6 +182,9 @@ function editText() {
     `resp ${e.resp}`,
     `follow ${e.follow}`,
     `look ${e.look}`,
+    `dz ${e.dz}`,
+    `cs ${e.cs}`,
+    `clk ${e.clk ? 1 : 0}`,
     `aspect ${e.aspect}`,
     `width ${e.width}`,
   ];
@@ -257,6 +268,8 @@ async function toggleRecord() {
         edit: editText(),
         monitor: state.monitor,
         hw: state.hw,
+        audioSystem: $('recAudioSys') ? $('recAudioSys').checked : false,
+        audioMic: $('recAudioMic') ? $('recAudioMic').checked : false,
       });
       state.recDir = dir;
       $('recTime').textContent = '00:00.0';
@@ -277,11 +290,35 @@ async function toggleRecord() {
         if (c) await selectClip(c.dir);
       }
       toast('录制完成 ' + msg, 3200);
+      // Check the take before leaving: a frozen opening or a drifting audio
+      // track is invisible until someone watches it, and by then it is too late
+      // to simply record again.
+      probeJustRecorded();
       document.querySelector('.tab[data-tab="edit"]').click();
     } catch (e) {
       setRecording(false);
       $('recWarn').textContent = '停止失败: ' + e;
     }
+  }
+}
+
+// Runs the health report on the take that just finished and surfaces anything
+// that would make it look wrong. Silent when the take is clean.
+async function probeJustRecorded() {
+  const dir = state.recDir;
+  if (!dir) return;
+  try {
+    const report = await invoke('probe_clip', { dir });
+    if (report && !report.good && report.issues && report.issues.length) {
+      const line = report.issues.join('；');
+      $('recWarn').textContent = '这段素材有问题：' + line;
+      toast('录制完成，但' + line, 6000);
+      logUi('warn', `体检: ${line} (${dir})`);
+    } else if (report) {
+      logUi('info', `体检通过: ${report.frames} 帧 / 补帧 ${report.duplicates}`);
+    }
+  } catch (e) {
+    logUi('error', `体检失败: ${e}`);
   }
 }
 
@@ -319,13 +356,66 @@ async function syncRecordingState() {
 
 setInterval(syncRecordingState, 800);
 
+// The viewport cannot be larger than the screen, so on a small monitor the zoom
+// slider stops doing anything. Say so instead of letting the take surprise you.
+let fitTimer = 0;
+function updateFitHint() {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(async () => {
+    const el = $('recFitWarn');
+    if (!el || !IS_TAURI) return;
+    try {
+      const fit = await invoke('viewport_fit', { edit: editText(), monitor: state.monitor });
+      if (fit && fit.limited) {
+        el.classList.remove('is-hidden');
+        el.textContent = `缩放受限 ${fit.effective_zoom.toFixed(2)}×`;
+        el.title = `屏幕 ${fit.monitor[2]}×${fit.monitor[3]} 放不下 ${Math.round(
+          fit.requested[0]
+        )}×${Math.round(fit.requested[1])} 的视口，实际为 ${Math.round(fit.actual[0])}×${Math.round(
+          fit.actual[1]
+        )}`;
+      } else {
+        el.classList.add('is-hidden');
+      }
+    } catch {}
+  }, 120);
+}
+
 $('recHw').onchange = () => {
   state.hw = $('recHw').checked;
 };
 
+// Audio switches save themselves: they are a capture preference, not part of the
+// clip, so there is nothing to re-bake when they change.
+async function saveAudioPrefs() {
+  const st = state.appSettings;
+  if (!st) return;
+  try {
+    await invoke('set_app_settings', {
+      capturesDir: st.configured || '',
+      hw: !!st.hw,
+      hud: !!st.hud,
+      verbose: !!st.verbose,
+      audioSystem: $('recAudioSys') ? $('recAudioSys').checked : false,
+      audioMic: $('recAudioMic') ? $('recAudioMic').checked : false,
+    });
+    st.audioSys = $('recAudioSys') ? $('recAudioSys').checked : false;
+    st.audioMic = $('recAudioMic') ? $('recAudioMic').checked : false;
+  } catch (e) {
+    logUi('error', `保存音频开关失败: ${e}`);
+    toast('音频开关未能保存');
+  }
+}
+
+for (const id of ['recAudioSys', 'recAudioMic']) {
+  const box = $(id);
+  if (box) box.onchange = saveAudioPrefs;
+}
+
 $('recMonitor').onchange = async (ev) => {
   state.monitor = Number(ev.target.value) || 0;
   paintRecHint();
+  updateFitHint();
   await restartPreview();
 };
 
@@ -445,8 +535,12 @@ if (IS_TAURI) {
 /* ---------------- app settings ---------------- */
 async function loadAppSettings() {
   try {
-    const [effective, configured, hw, hud, verbose] = await invoke('app_settings');
-    state.appSettings = { effective, configured, hw, hud, verbose };
+    const [effective, configured, hw, hud, verbose, audioSys, audioMic] = await invoke('app_settings');
+    state.appSettings = { effective, configured, hw, hud, verbose, audioSys, audioMic };
+    const sysBox = $('recAudioSys');
+    const micBox = $('recAudioMic');
+    if (sysBox) sysBox.checked = !!audioSys;
+    if (micBox) micBox.checked = !!audioMic;
   } catch (e) {
     // Never swallow this silently: a failed read here decides the output folder
     // and the default encode mode for the whole session.
@@ -519,7 +613,14 @@ $('setSave').onclick = async () => {
   const hud = $('setHud').checked;
   const verbose = $('setVerbose') ? $('setVerbose').checked : false;
   try {
-    await invoke('set_app_settings', { capturesDir: dir, hw, hud, verbose });
+    await invoke('set_app_settings', {
+      capturesDir: dir,
+      hw,
+      hud,
+      verbose,
+      audioSystem: $('recAudioSys') ? $('recAudioSys').checked : false,
+      audioMic: $('recAudioMic') ? $('recAudioMic').checked : false,
+    });
     await loadAppSettings();
     // apply immediately where it is cheap to do so
     state.hw = !!hw && !!state.nvenc;
@@ -568,7 +669,11 @@ const PARAMS = [
   { key: 'resp', label: '速度响应', min: 0, max: 100, step: 1, fmt: (v) => Math.round(v) },
   { key: 'follow', label: '跟随速度', min: 0.4, max: 6, step: 0.1, fmt: (v) => v.toFixed(1) + ' Hz' },
   { key: 'look', label: '前瞻量', min: 0, max: 300, step: 5, fmt: (v) => Math.round(v) + ' ms' },
+  { key: 'dz', label: '稳定死区', min: 0, max: 15, step: 1, fmt: (v) => Math.round(v) + '%' },
+  { key: 'cs', label: '光标平滑', min: 0, max: 250, step: 5, fmt: (v) => Math.round(v) + ' ms' },
+  { key: 'clk', label: '点击强调', type: 'check' },
 ];
+
 
 function buildParams(target) {
   const grid = $(target || 'paramsGrid');
@@ -580,6 +685,21 @@ function buildParams(target) {
     lab.className = 'row-label';
     lab.textContent = p.label;
     row.appendChild(lab);
+
+    if (p.type === 'check') {
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'row-check';
+      cb.checked = !!state.edit[p.key];
+      cb.onchange = () => {
+        pushUndo();
+        state.edit[p.key] = cb.checked ? 1 : 0;
+        onParamChanged();
+      };
+      row.appendChild(cb);
+      grid.appendChild(row);
+      continue;
+    }
 
     if (p.type === 'select') {
       const sel = document.createElement('select');
@@ -613,6 +733,8 @@ function buildParams(target) {
         val.textContent = p.fmt(Number(inp.value));
       };
       paint();
+      // one undo step per drag, captured before the value moves
+      inp.onpointerdown = () => pushUndo();
       inp.oninput = () => {
         state.edit[p.key] = Number(inp.value);
         paint();
@@ -678,6 +800,48 @@ function buildParams(target) {
   }
 }
 
+// ---------- undo / redo ----------
+// A snapshot of everything an edit can touch. Strings keep it trivial to
+// compare and impossible to get subtly wrong in the way per-action inverses are.
+function editState() {
+  return JSON.stringify({ trim: state.trim, kfs: state.kfs, edit: state.edit });
+}
+
+function pushUndo() {
+  const snap = editState();
+  if (state.undoStack.length && state.undoStack[state.undoStack.length - 1] === snap) return;
+  state.undoStack.push(snap);
+  if (state.undoStack.length > 80) state.undoStack.shift();
+  state.redoStack.length = 0;
+}
+
+function applyEditState(json) {
+  const o = JSON.parse(json);
+  state.trim = o.trim;
+  state.kfs = o.kfs || [];
+  Object.assign(state.edit, o.edit || {});
+  buildParams('paramsGrid');
+  buildParams('recParamsGrid');
+  drawTimeline();
+  drawLeft();
+  onParamChanged();
+}
+
+function undo() {
+  if (!state.undoStack.length) {
+    toast('没有可撤销的操作');
+    return;
+  }
+  state.redoStack.push(editState());
+  applyEditState(state.undoStack.pop());
+}
+
+function redo() {
+  if (!state.redoStack.length) return;
+  state.undoStack.push(editState());
+  applyEditState(state.redoStack.pop());
+}
+
 function scheduleRebake() {
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
@@ -692,6 +856,7 @@ function scheduleRebake() {
 let rebakeTimer = 0;
 function onParamChanged() {
   saveParams();
+  updateFitHint();
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
     await rebake();
@@ -823,12 +988,26 @@ async function selectClip(dir) {
   $('monInfo').textContent = `${c.mon_w}×${c.mon_h} · ${c.fps}fps`;
   $('tcTotal').textContent = tc(c.duration);
   state.track = await invoke('track_points', { dir: c.dir });
+  // press moments, for snapping cuts onto them
+  {
+    const clicks = [];
+    let down = false;
+    for (const q of state.track) {
+      const now = (Math.floor(q[3] || 0) & 1) === 1;
+      if (now && !down) clicks.push(q[0]);
+      down = now;
+    }
+    state.clicks = clicks;
+  }
+  state.tlPan = null;
   state.proxyReady = false;
   state.proxyStale = false;
   // trims and keyframes are clip-specific: times from the old clip are
   // meaningless (or out of range) on the new one
   state.trim = null;
   state.kfs = [];
+  state.undoStack.length = 0;
+  state.redoStack.length = 0;
   $('cropVideo').classList.remove('is-on');
   await rebake();
   await setupMedia();
@@ -1089,6 +1268,7 @@ $('viewCanvas').addEventListener('mousedown', (ev) => {
     if (d < bestD) { bestD = d; best = i; }
   }
   if (best === null) {
+    pushUndo();
     state.kfs.push({ t, x: p.x, y: p.y });
     best = state.kfs.length - 1;
   }
@@ -1248,7 +1428,9 @@ function tlGeom() {
   const playT = state.frame / fps;
   const start = dur - span <= 0
     ? 0
-    : Math.min(Math.max(0, playT - span / 2), dur - span);
+    : state.tlPan !== null
+      ? Math.min(Math.max(0, state.tlPan), dur - span)
+      : Math.min(Math.max(0, playT - span / 2), dur - span);
   return { ctx, w, h, dur, span, start, x0: TL.pad, x1: w - TL.pad };
 }
 
@@ -1371,7 +1553,34 @@ function drawTimeline() {
   roundRect(ctx, px - 4.5, laneY - 10, 9, 9, 3);
   ctx.fill();
 
+  // while a trim handle is dragged, name the frame it is parked on
+  if (state.dragHint) {
+    const txt = tc(state.dragHint.t);
+    const hx = timeToX(g, state.dragHint.t);
+    ctx.font = '11px "Segoe UI", system-ui, sans-serif';
+    const tw = ctx.measureText(txt).width + 12;
+    let bx = hx - tw / 2;
+    bx = Math.max(2, Math.min(bx, w - tw - 2));
+    ctx.fillStyle = 'rgba(79,140,255,.95)';
+    roundRect(ctx, bx, 1, tw, 17, 4);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(txt, bx + tw / 2, 9.5);
+    ctx.textAlign = 'start';
+  }
+
   $('tcNow').textContent = tc(state.frame / (state.bake ? state.bake.fps : 30));
+  const tin = $('trimIn');
+  const tout = $('trimOut');
+  if (tin && tout) {
+    const on = !!state.trim;
+    tin.style.opacity = on ? '' : '0.35';
+    tout.style.opacity = on ? '' : '0.35';
+    tin.textContent = tc(on ? state.trim.a : 0);
+    tout.textContent = tc(on ? state.trim.b : (state.clip ? state.clip.duration : 0));
+  }
   const tcEl = $('trimChip');
   if (tcEl) {
     if (state.trim) {
@@ -1429,12 +1638,44 @@ function niceStep(dur, target) {
 }
 
 function seekTo(x) {
-  const g = tlGeom();
-  state.frame = Math.max(0, Math.min((state.bake ? state.bake.frames : 1) - 1,
-    Math.round(xToTime(g, x) * (state.bake ? state.bake.fps : 30))));
+  seekToTime(xToTime(tlGeom(), x));
+}
+
+/// Move the playhead to a time and refresh everything that shows it.
+function seekToTime(t, opts) {
+  const fps = state.bake ? state.bake.fps : 30;
+  const last = (state.bake ? state.bake.frames : 1) - 1;
+  state.frame = Math.max(0, Math.min(last, Math.round(t * fps)));
+  if (state.useVideo && !(opts && opts.keepVideos)) {
+    seekVideos(state.frame / fps);
+  }
   drawTimeline();
   drawLeft();
-  scheduleStill();
+  if (!(opts && opts.noStill)) scheduleStill();
+}
+
+/// Round a time to the nearest frame, or to a click when one is close enough.
+///
+/// A recording's "start of the interesting part" is usually a press, so snapping
+/// there means the cut lands exactly on the click instead of a few pixels off.
+function snapTime(t) {
+  const fps = state.bake ? state.bake.fps : 30;
+  const g = tlGeom();
+  const pxPerSec = (g.x1 - g.x0) / Math.max(g.span, 1e-6);
+  const tol = 9 / pxPerSec;
+  // A press wins over a frame boundary even when the boundary is a pixel
+  // closer: the point of the snap is to land the cut on the click.
+  let best = null;
+  let bestD = tol;
+  for (const c of state.clicks) {
+    const d = Math.abs(t - c);
+    if (d <= bestD) {
+      best = c;
+      bestD = d;
+    }
+  }
+  if (best !== null) return best;
+  return Math.round(t * fps) / fps;
 }
 
 // ---- mouse: drag trim handles, otherwise scrub
@@ -1442,17 +1683,31 @@ const tlCanvas = $('tlCanvas');
 let tlDrag = null;
 let tlDragAnchor = 0;
 
+let panAnchorX = 0;
+let panStart = 0;
+
 tlCanvas.addEventListener('mousedown', (ev) => {
   const r = tlCanvas.getBoundingClientRect();
   const x = ev.clientX - r.left;
   const g = tlGeom();
   const hs = trimHandles(g);
 
+  // middle button drags the window sideways, so a long clip can be inspected
+  // at a zoom level where one pixel is one frame
+  if (ev.button === 1) {
+    ev.preventDefault();
+    tlDrag = 'pan';
+    panAnchorX = x;
+    panStart = g.start;
+    return;
+  }
+
   if (hs) {
-    if (Math.abs(x - hs.a) <= TRIM_HIT) { tlDrag = 'a'; return; }
-    if (Math.abs(x - hs.b) <= TRIM_HIT) { tlDrag = 'b'; return; }
+    if (Math.abs(x - hs.a) <= TRIM_HIT) { pushUndo(); tlDrag = 'a'; return; }
+    if (Math.abs(x - hs.b) <= TRIM_HIT) { pushUndo(); tlDrag = 'b'; return; }
   }
   if (state.trimMode) {
+    pushUndo();
     tlDrag = 'new';
     const t = xToTime(g, x);
     state.trim = { a: t, b: t };
@@ -1463,6 +1718,22 @@ tlCanvas.addEventListener('mousedown', (ev) => {
   tlDrag = 'seek';
   seekTo(x);
 });
+
+// wheel zooms around the pointer, which is the only place you want to keep still
+tlCanvas.addEventListener('wheel', (ev) => {
+  if (!state.clip) return;
+  ev.preventDefault();
+  const r = tlCanvas.getBoundingClientRect();
+  const g = tlGeom();
+  const x = ev.clientX - r.left;
+  const under = xToTime(g, x);
+  const frac = (under - g.start) / Math.max(g.span, 1e-6);
+  state.zoom = Math.max(-4, Math.min(7, (state.zoom || 0) + (ev.deltaY < 0 ? 0.5 : -0.5)));
+  const span2 = Math.max(0.35, g.dur / Math.pow(2, state.zoom));
+  state.tlPan = Math.max(0, Math.min(under - frac * span2, Math.max(0, g.dur - span2)));
+  drawTimeline();
+  drawLeft();
+}, { passive: false });
 
 tlCanvas.addEventListener('dblclick', () => {
   state.trim = null;
@@ -1475,6 +1746,14 @@ window.addEventListener('mousemove', (ev) => {
   const r = tlCanvas.getBoundingClientRect();
   const x = ev.clientX - r.left;
   if (tlDrag === 'seek') { seekTo(x); return; }
+  if (tlDrag === 'pan') {
+    const g = tlGeom();
+    const perPx = g.span / Math.max(1, g.x1 - g.x0);
+    const start = panStart - (x - panAnchorX) * perPx;
+    state.tlPan = Math.max(0, Math.min(start, Math.max(0, g.dur - g.span)));
+    drawTimeline();
+    return;
+  }
 
   const g = tlGeom();
   const t = xToTime(g, x);
@@ -1482,19 +1761,24 @@ window.addEventListener('mousemove', (ev) => {
   const minGap = 3 / fps;
 
   if (tlDrag === 'new') {
-    state.trim = { a: Math.min(tlDragAnchor, t), b: Math.max(tlDragAnchor, t) };
-    drawTimeline();
-    drawLeft();
+    const ta = snapTime(tlDragAnchor);
+    const tb = snapTime(t);
+    state.trim = { a: Math.min(ta, tb), b: Math.max(ta, tb) };
+    state.dragHint = { t: tb };
+    seekToTime(tb, { noStill: true });
     return;
   }
 
   if (!state.trim) state.trim = { a: 0, b: g.dur };
-  if (tlDrag === 'a') state.trim.a = Math.min(t, state.trim.b - minGap);
-  else state.trim.b = Math.max(t, state.trim.a + minGap);
-  state.trim.a = Math.max(0, state.trim.a);
-  state.trim.b = Math.min(g.dur, state.trim.b);
-  drawTimeline();
-  drawLeft();
+  const snapped = snapTime(t);
+  if (tlDrag === 'a') {
+    state.trim.a = Math.min(Math.max(0, snapped), state.trim.b - minGap);
+  } else {
+    state.trim.b = Math.max(Math.min(g.dur, snapped), state.trim.a + minGap);
+  }
+  // the frame under the handle is the one being chosen, so show it
+  state.dragHint = { t: tlDrag === 'a' ? state.trim.a : state.trim.b };
+  seekToTime(state.dragHint.t, { noStill: true });
 });
 
 window.addEventListener('mouseup', () => {
@@ -1503,8 +1787,12 @@ window.addEventListener('mouseup', () => {
     if (state.trim.b - state.trim.a < 3 / fps) state.trim = null;
     drawTimeline();
     drawLeft();
-  } else if (tlDrag && tlDrag !== 'seek') {
+  } else if (tlDrag && tlDrag !== 'seek' && tlDrag !== 'pan') {
     markTrimDirty();
+  }
+  if (state.dragHint) {
+    state.dragHint = null;
+    drawTimeline();
   }
   tlDrag = null;
 });
@@ -1639,7 +1927,7 @@ function onPlaybackEnd() {
 $('viewVideo').addEventListener('ended', onPlaybackEnd);
 $('cropVideo').addEventListener('ended', onPlaybackEnd);
 
-$('btnPlay').onclick = () => {
+function togglePlay() {
   if (state.playing) {
     stopPlayback();
     return;
@@ -1656,7 +1944,148 @@ $('btnPlay').onclick = () => {
     drawLeft();
   }
   startPlayback();
+}
+
+$('btnPlay').onclick = togglePlay;
+
+// Space toggles playback, the way every other editor does it. Typing fields keep
+// their spaces: the inline number editor and the search box are inputs, and the
+// record tab has its own shortcuts.
+document.addEventListener('keydown', (e) => {
+  if (e.code !== 'Space' && e.key !== ' ') return;
+  if (e.repeat) return;
+  const t = e.target;
+  const tag = t && t.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) {
+    return;
+  }
+  const rec = document.getElementById('stageRecord');
+  if (rec && !rec.classList.contains('is-hidden')) return;
+  e.preventDefault(); // a focused button must not also click itself
+  togglePlay();
+});
+
+// Frame stepping and undo, the two things a timeline is unusable without.
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  const tag = t && t.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+  const rec = document.getElementById('stageRecord');
+  if (rec && !rec.classList.contains('is-hidden')) return;
+
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    if (e.shiftKey) redo();
+    else undo();
+    return;
+  }
+  if (mod && e.key.toLowerCase() === 'y') {
+    e.preventDefault();
+    redo();
+    return;
+  }
+
+  const fps = state.bake ? state.bake.fps : 30;
+  const last = (state.bake ? state.bake.frames : 1) - 1;
+  const jump = (n) => {
+    state.frame = Math.max(0, Math.min(last, n));
+    if (state.useVideo && !state.playing) seekVideos(state.frame / fps);
+    drawTimeline();
+    drawLeft();
+    scheduleStill();
+  };
+
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    const step = (e.shiftKey ? 10 : 1) * (e.key === 'ArrowLeft' ? -1 : 1);
+    jump(state.frame + step);
+  } else if (e.key === 'Home') {
+    e.preventDefault();
+    jump(0);
+  } else if (e.key === 'End') {
+    e.preventDefault();
+    jump(last);
+  }
+});
+
+// ---------- editable time codes ----------
+// Both the playhead readout and the trim points take typed values: dragging is
+// for finding a moment, typing is for landing on an exact frame.
+function editTimeInline(el, seconds, commit) {
+  if (el.dataset.editing) return;
+  el.dataset.editing = '1';
+  const prev = el.textContent;
+  const ed = document.createElement('input');
+  ed.type = 'text';
+  ed.className = 'row-val-edit';
+  ed.value = secToTc(seconds);
+  el.textContent = '';
+  el.appendChild(ed);
+  ed.focus();
+  ed.select();
+  let done = false;
+  const finish = (ok) => {
+    if (done) return;
+    done = true;
+    el.dataset.editing = '';
+    const v = parseTc(ed.value);
+    // setting textContent already drops the input; removing it again throws and
+    // would skip the commit entirely
+    el.textContent = prev;
+    if (ok && v !== null) commit(v);
+  };
+  ed.onkeydown = (ev) => {
+    if (ev.key === 'Enter') finish(true);
+    else if (ev.key === 'Escape') finish(false);
+    ev.stopPropagation();
+  };
+  ed.onblur = () => finish(true);
+}
+
+// accepts 12.5, 00:12.5, 1:02.35 or 01:02:03.4
+function parseTc(text) {
+  const t = (text || '').trim();
+  if (!t) return null;
+  const parts = t.split(':').map((x) => x.trim());
+  if (parts.some((x) => x === '' || isNaN(Number(x)))) return null;
+  const nums = parts.map(Number);
+  if (nums.length === 1) return nums[0];
+  if (nums.length === 2) return nums[0] * 60 + nums[1];
+  if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
+  return null;
+}
+
+function secToTc(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
+}
+
+$('tcNow').ondblclick = () => {
+  const fps = state.bake ? state.bake.fps : 30;
+  editTimeInline($('tcNow'), state.frame / fps, (v) => seekToTime(v));
 };
+
+for (const [id, which] of [['trimIn', 'a'], ['trimOut', 'b']]) {
+  $(id).ondblclick = () => {
+    if (!state.trim) {
+      toast('先框选一段要保留的区间');
+      return;
+    }
+    editTimeInline($(id), state.trim[which], (v) => {
+      pushUndo();
+      const fps = state.bake ? state.bake.fps : 30;
+      const dur = state.clip ? state.clip.duration : v;
+      if (which === 'a') state.trim.a = Math.max(0, Math.min(v, state.trim.b - 3 / fps));
+      else state.trim.b = Math.min(dur, Math.max(v, state.trim.a + 3 / fps));
+      drawTimeline();
+      drawLeft();
+      markTrimDirty();
+      seekToTime(which === 'a' ? state.trim.a : state.trim.b);
+    });
+  };
+}
 
 $('btnProxy').onclick = generateProxy;
 

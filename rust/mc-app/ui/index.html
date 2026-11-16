@@ -92,7 +92,7 @@
       <div class="tl-head">
         <select id="clipSel" class="clip-select" title="选择录制素材"></select>
         <span class="vsep"></span>
-        <button class="icon-btn" id="btnPlay" title="播放 / 暂停">
+        <button class="icon-btn" id="btnPlay" title="播放 / 暂停（空格）">
           <svg id="icoPlay" width="12" height="12" viewBox="0 0 12 12"><path d="M3.4 2.2l6 3.8-6 3.8z" fill="currentColor"/></svg>
           <svg id="icoPause" width="12" height="12" viewBox="0 0 12 12" style="display:none"><rect x="3" y="2.4" width="2.2" height="7.2" fill="currentColor"/><rect x="6.8" y="2.4" width="2.2" height="7.2" fill="currentColor"/></svg>
         </button>
@@ -105,6 +105,8 @@
                 title="播放到尾帧后自动回到首帧继续播放">自动回放</button>
         <button class="head-btn" id="trimToggle" title="开启后拖动时间线可框选保留区间">裁切</button>
         <button class="head-btn" id="btnTrimClear" title="清除裁切（或双击时间线）">清除裁切</button>
+        <span class="tc tc-dim" id="trimIn" title="入点，双击可输入时间码">00:00.00</span>
+        <span class="tc tc-dim" id="trimOut" title="出点，双击可输入时间码">00:00.00</span>
         <div class="seg seg-sm" id="tlZoom">
           <button data-z="0" class="is-active">全览</button>
           <button data-z="1">2×</button>
@@ -139,6 +141,7 @@
         <span class="dot dot-cam"></span>
         <span class="vp-title">跟拍视口 · 预览</span>
         <span class="chip" id="recCropInfo">—</span>
+        <span class="chip chip-warn is-hidden" id="recFitWarn" title="当前屏幕放不下这个缩放，实际视口被限制了">缩放受限</span>
         <select class="sel-mini" id="recMonitor" title="选择要录制的屏幕"></select>
         <span class="spacer"></span>
         <button class="head-btn is-on" id="hudToggle" title="在屏幕上显示跟拍取景框（不会被录进去）">取景框</button>
@@ -163,6 +166,12 @@
       <span class="spacer"></span>
       <label class="chk hw-chk" title="用显卡编码，大幅降低录制时的 CPU 占用">
         <input type="checkbox" id="recHw" /> 硬件编码
+      </label>
+      <label class="chk" title="录制时同时录入电脑播放的声音（系统声）">
+        <input type="checkbox" id="recAudioSys" /> 电脑声音
+      </label>
+      <label class="chk" title="录制时同时录入麦克风">
+        <input type="checkbox" id="recAudioMic" /> 麦克风
       </label>
     </section>
 

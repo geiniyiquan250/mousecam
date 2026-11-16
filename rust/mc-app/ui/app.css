@@ -814,3 +814,20 @@ body.split-drag * { pointer-events: none; }
   opacity: .45;
   cursor: not-allowed;
 }
+
+
+/* the viewport is being clipped by the screen size */
+.chip-warn {
+  color: #ffcf70;
+  background: rgba(255, 190, 80, .14);
+  border: 1px solid rgba(255, 190, 80, .35);
+}
+
+/* a parameter that is on or off rather than a slider */
+.row .row-check {
+  justify-self: start;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}

@@ -85,7 +85,9 @@ node tools\push-via-api.mjs --yes            :: 真正推送
 node tools\push-via-api.mjs --yes --tag v0.3.0   :: 顺带推一个 tag
 ```
 
-**提交 SHA 保持不变。** 重建 commit 时用的是原来的 author 与 committer（含时间戳），所以推完本地和远端指向同一个 SHA，不需要 `git reset`。万一服务端重建了对象，工具会打印需要执行的 `git fetch && git reset --hard`。
+**SHA 什么时候不变**：重建 commit 用的是原始 author / committer。GitHub 会把提交时间统一成 UTC 表示，所以**在 UTC 时区创建的提交**推完 SHA 完全一致；在别的时区创建的提交，同一时刻会写成 `+0000`，字节不同、SHA 也就变了。
+
+后一种情况工具会自动把本地分支移到服务端的新提交上——两者树对象完全相同，工作区文件不会有任何变化——所以推完 `git status` 依然是干净的。不想让它动本地就加 `--no-adopt`，工具会只打印命令。
 
 Token 取 `GH_TOKEN` / `GITHUB_TOKEN` 环境变量，否则从 `git credential` 里读 `github.com` 的凭据；不落盘。
 

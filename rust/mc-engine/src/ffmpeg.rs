@@ -285,6 +285,82 @@ impl Drop for FrameReader {
 }
 
 /// Reads `Duration: HH:MM:SS.ss` out of ffmpeg's banner.
+/// Muxes WAV tracks into an already-encoded video, replacing it in place.
+///
+/// `at` is where the audio should start, so a trimmed render keeps the sound that
+/// belongs to the frames it kept rather than the sound of the whole take. `dur`
+/// caps the result: the picture is the authority on length, and the audio is
+/// padded to reach it instead of cutting the video short.
+pub fn mux_audio(
+    ffmpeg: &Path,
+    video: &Path,
+    tracks: &[std::path::PathBuf],
+    at: f64,
+    dur: Option<f64>,
+) -> Result<(), String> {
+    if tracks.is_empty() || !video.exists() {
+        return Ok(());
+    }
+    let ext = video
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".into());
+    let tmp = video.with_file_name(format!(
+        "{}.mux.{ext}",
+        video.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    ));
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.arg("-i").arg(video);
+    for t in tracks {
+        if at > 0.0005 {
+            cmd.arg("-ss").arg(format!("{at:.3}"));
+        }
+        cmd.arg("-i").arg(t);
+    }
+    cmd.arg("-map").arg("0:v:0");
+    if tracks.len() == 1 {
+        cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
+    } else {
+        let graph = format!(
+            "[1:a][2:a]amix=inputs={}:duration=longest:normalize=0[mix];[mix]apad[a]",
+            tracks.len()
+        );
+        cmd.arg("-filter_complex").arg(graph);
+        cmd.arg("-map").arg("[a]");
+    }
+    cmd.arg("-c:v").arg("copy");
+    cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k").arg("-ar").arg("48000");
+    if let Some(d) = dur {
+        if d > 0.0 {
+            cmd.arg("-t").arg(format!("{d:.3}"));
+        }
+    }
+    cmd.arg("-shortest");
+    if ext == "mp4" || ext == "mov" {
+        cmd.arg("-movflags").arg("+faststart");
+    }
+    cmd.arg(&tmp);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("调用 ffmpeg 封装音频失败: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    if std::fs::remove_file(video).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("替换成片失败：无法删除原文件".into());
+    }
+    std::fs::rename(&tmp, video).map_err(|e| format!("替换成片失败: {e}"))
+}
+
 pub fn media_duration(ffmpeg: &Path, file: &Path) -> f64 {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-i"]).arg(file);

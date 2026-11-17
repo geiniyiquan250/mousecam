@@ -202,10 +202,27 @@ pub fn render_clip(
     let t0 = Instant::now();
     let mut written = 0i32;
     let mut src_cur = 0i32;
-    let total = fmap.len() as i32;
+    // `fmap` holds *source* frame indices. When the export asks for a different
+    // rate, resample it: each output frame picks the source frame that was on
+    // screen at that moment. Writing one output frame per source frame at a
+    // different `-r` would change nothing but the playback speed.
+    let src_of_out: Vec<i32> = if s.fps == clip.fps || fmap.is_empty() {
+        fmap.clone()
+    } else {
+        let n = ((fmap.len() as f64) * (s.fps as f64) / (clip.fps as f64))
+            .round()
+            .max(1.0) as usize;
+        (0..n)
+            .map(|k| {
+                let i = ((k as f64) * (clip.fps as f64) / (s.fps as f64)).floor() as usize;
+                fmap[i.min(fmap.len() - 1)]
+            })
+            .collect()
+    };
+    let total = src_of_out.len() as i32;
 
     for k in 0..total {
-        let target = fmap[k as usize];
+        let target = src_of_out[k as usize];
         while src_cur <= target {
             if !reader.read_frame(&mut frame_buf) {
                 src_cur = -1;
@@ -242,7 +259,7 @@ pub fn render_clip(
         rs.prep(lx as f32, ly as f32, rw as f32, rh as f32, out_w, out_h);
         rs.run(&frame_buf, clip.mon.w, clip.mon.h, &mut crop_buf, out_w);
 
-        let now_t = target as f64 / s.fps as f64;
+        let now_t = target as f64 / clip.fps as f64;
         let sc_all = out_w as f32 / rw as f32;
 
         // Rings go under the pointer so the arrow stays readable on top.
@@ -263,7 +280,7 @@ pub fn render_clip(
         }
 
         if let Some(spr) = &sprite {
-            let mpt: Vec2 = cursor_at(&draw_track, edit, target as f64 / s.fps as f64);
+            let mpt: Vec2 = cursor_at(&draw_track, edit, target as f64 / clip.fps as f64);
             let sc = out_w as f32 / rw as f32;
             // same rule as the live recorder, taken from the baked rect so an
             // export matches what was on screen while recording

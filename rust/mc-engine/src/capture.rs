@@ -212,6 +212,12 @@ impl Dda {
             }
             let _ = self.dup.ReleaseFrame();
             if !copied {
+                // A colour format we cannot convert means the copy never
+                // happened. Reporting the previous frame as a fresh one would
+                // record a still image and call it a successful take.
+                if self.unsupported_format.is_some() {
+                    return false;
+                }
                 return self.have_frame;
             }
 

@@ -616,6 +616,30 @@ pub fn export(
         crf,
         |_, _| {},
     )?;
+
+    // The frames were written without sound (`FrameWriter` pipes raw video), so
+    // the take's audio has to be attached afterwards - otherwise trimming or
+    // changing the frame size silently produces a mute file.
+    let audio: Vec<PathBuf> = ["audio_system.wav", "audio_mic.wav"]
+        .iter()
+        .map(|n| PathBuf::from(&dir).join(n))
+        .filter(|p| p.is_file() && p.metadata().map(|m| m.len() > 1024).unwrap_or(false))
+        .collect();
+    let ext = sum
+        .out_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !audio.is_empty() && ext != "gif" {
+        // one kept range: the sound starts where the picture starts
+        let at = e.trims.first().map(|t| t.0).unwrap_or(0.0);
+        let dur = sum.frames as f64 / s.fps as f64;
+        if let Err(err) = mc_engine::ffmpeg::mux_audio(&ff, &sum.out_path, &audio, at, Some(dur)) {
+            mc_engine::mc_warn!("export", "封装音频失败: {err}");
+        } else {
+            mc_engine::mc_info!("export", "已加入 {} 条音轨，起点 {at:.3}s", audio.len());
+        }
+    }
     // Show the result where it landed: exporting is the end of a long session
     // and hunting for the file in a captures folder is pure friction.
     #[cfg(windows)]

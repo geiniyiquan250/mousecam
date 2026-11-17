@@ -200,3 +200,70 @@ impl Resampler {
         }
     }
 }
+
+#[cfg(test)]
+mod subpixel_tests {
+    use super::*;
+
+    /// A horizontal ramp: shifting the source window by a fraction of a pixel
+    /// must change the output, because that is the whole point of sampling from
+    /// a fractional origin. Rounding the origin first makes these two identical.
+    fn ramp(w: i32, h: i32) -> Vec<u32> {
+        // High frequency on purpose: a smooth gradient would hide a quarter
+        // pixel inside the 8-bit rounding of the fixed-point maths.
+        let mut v = vec![0u32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let g = ((x * 37 + y * 17 + (x * y % 7) * 53) as u32) & 0xFF;
+                v[(y * w + x) as usize] = 0xFF00_0000 | (g << 16) | (g << 8) | g;
+            }
+        }
+        v
+    }
+
+    fn render(sx: f32) -> Vec<u32> {
+        let src = ramp(64, 32);
+        let mut rs = Resampler::new();
+        rs.prep(sx, 0.0, 20.0, 16.0, 20, 16);
+        let mut dst = vec![0u32; 20 * 16];
+        rs.run(&src, 64, 32, &mut dst, 20);
+        dst
+    }
+
+    #[test]
+    fn a_fractional_shift_reaches_the_output() {
+        let a = render(10.0);
+        let b = render(10.25);
+        assert_ne!(a, b, "a quarter-pixel shift produced an identical image");
+    }
+
+    #[test]
+    fn shifts_are_monotonic_not_binary() {
+        // The picture must move by a quarter of a pixel, not snap a whole one:
+        // the 10.25 image has to sit between 10.0 and 10.5.
+        let a = render(10.0);
+        let q = render(10.25);
+        let h = render(10.5);
+        assert_ne!(a, q);
+        assert_ne!(q, h);
+        assert_ne!(a, h);
+    }
+
+    #[test]
+    fn integral_origin_with_matching_size_is_a_copy() {
+        let src = ramp(64, 32);
+        let mut rs = Resampler::new();
+        rs.prep(8.0, 4.0, 20.0, 16.0, 20, 16);
+        let mut dst = vec![0u32; 20 * 16];
+        rs.run(&src, 64, 32, &mut dst, 20);
+        for y in 0..16 {
+            for x in 0..20 {
+                assert_eq!(
+                    dst[y * 20 + x],
+                    src[(y + 4) * 64 + (x + 8)],
+                    "aligned 1:1 should not be filtered at {x},{y}"
+                );
+            }
+        }
+    }
+}

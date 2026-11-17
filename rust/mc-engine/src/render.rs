@@ -107,7 +107,14 @@ pub fn bake_path(clip: &ClipInfo, s: &Settings, edit: &EditList) -> (Vec<CamFram
     (out, t0.elapsed().as_secs_f64() * 1000.0)
 }
 
-pub fn frame_src_rect(cf: &CamFrameOut, mon: IRect) -> IRect {
+/// The crop window in source pixels, *not* rounded.
+///
+/// The camera solves in continuous coordinates and the resampler interpolates
+/// from fractional origins, so rounding here throws away motion the rest of the
+/// chain can represent: a slow pan would sit still for several frames and then
+/// jump a whole pixel. `frame_src_rect` is the rounded form, for callers that
+/// really do need integer pixels.
+pub fn frame_src_rectf(cf: &CamFrameOut, mon: IRect) -> (f32, f32, f32, f32) {
     let mut w = cf.w.min(mon.w as f32);
     let mut h = cf.h.min(mon.h as f32);
     let mut x = cf.cx - w * 0.5;
@@ -130,7 +137,21 @@ pub fn frame_src_rect(cf: &CamFrameOut, mon: IRect) -> IRect {
     if h < 2.0 {
         h = 2.0;
     }
+    (x, y, w, h)
+}
+
+pub fn frame_src_rect(cf: &CamFrameOut, mon: IRect) -> IRect {
+    let (x, y, w, h) = frame_src_rectf(cf, mon);
     IRect::new(x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32)
+}
+
+/// Escape hatch for A/B comparisons: MC_SUBPIXEL=0 restores the old behaviour.
+fn subpixel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("MC_SUBPIXEL") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
 }
 
 pub fn render_clip(
@@ -223,28 +244,39 @@ pub fn render_clip(
             break;
         }
 
-        let r = frame_src_rect(&path[target as usize], clip.mon);
-        let mut lx = r.x - clip.mon.x;
-        let mut ly = r.y - clip.mon.y;
-        let mut rw = r.w;
-        let mut rh = r.h;
-        if lx < 0 {
-            lx = 0;
+        let (mut lx, mut ly, mut rw, mut rh) = if subpixel() {
+            let (fx, fy, fw, fh) = frame_src_rectf(&path[target as usize], clip.mon);
+            (fx - clip.mon.x as f32, fy - clip.mon.y as f32, fw, fh)
+        } else {
+            let r = frame_src_rect(&path[target as usize], clip.mon);
+            (
+                (r.x - clip.mon.x) as f32,
+                (r.y - clip.mon.y) as f32,
+                r.w as f32,
+                r.h as f32,
+            )
+        };
+        if lx < 0.0 {
+            lx = 0.0;
         }
-        if ly < 0 {
-            ly = 0;
+        if ly < 0.0 {
+            ly = 0.0;
         }
-        if lx + rw > clip.mon.w {
-            rw = clip.mon.w - lx;
+        if lx + rw > clip.mon.w as f32 {
+            rw = clip.mon.w as f32 - lx;
         }
-        if ly + rh > clip.mon.h {
-            rh = clip.mon.h - ly;
+        if ly + rh > clip.mon.h as f32 {
+            rh = clip.mon.h as f32 - ly;
         }
-        if rw < 4 || rh < 4 {
+        if rw < 4.0 || rh < 4.0 {
             continue;
         }
+        // The cursor and the click rings are placed in screen coordinates, so
+        // they need the same unrounded origin the picture is sampled from.
+        let (ox, oy) = (lx + clip.mon.x as f32, ly + clip.mon.y as f32);
 
-        rs.prep(lx as f32, ly as f32, rw as f32, rh as f32, out_w, out_h);
+        // Fractional origin: prep turns the remainder into bilinear weights.
+        rs.prep(lx, ly, rw, rh, out_w, out_h);
         rs.run(&frame_buf, clip.mon.w, clip.mon.h, &mut crop_buf, out_w);
 
         let now_t = target as f64 / clip.fps as f64;
@@ -260,8 +292,8 @@ pub fn render_clip(
                 &mut crop_buf,
                 out_w,
                 out_h,
-                (cx - r.x as f32) * sc_all,
-                (cy - r.y as f32) * sc_all,
+                (cx - ox) * sc_all,
+                (cy - oy) * sc_all,
                 age as f32,
                 sc_all,
             );
@@ -277,8 +309,8 @@ pub fn render_clip(
                 &mut crop_buf,
                 out_w,
                 out_h,
-                (mpt.x - r.x as f32) * sc,
-                (mpt.y - r.y as f32) * sc,
+                (mpt.x - ox) * sc,
+                (mpt.y - oy) * sc,
                 sc * grow,
                 spr,
             );

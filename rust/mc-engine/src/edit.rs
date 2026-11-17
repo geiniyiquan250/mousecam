@@ -201,6 +201,27 @@ pub fn cursor_at(track: &[TrackPt], edit: &EditList, t: f64) -> crate::camera::V
 }
 
 /// output frame index -> source frame index, honouring the trims
+/// Resamples a source-frame map onto a different output rate.
+///
+/// `build_frame_map` answers "which source frames were kept"; the writer stamps
+/// its output at the rate it was given, so writing one frame per kept source
+/// frame at another rate changes the playback speed instead of the frame rate.
+/// This picks, for every output frame, the kept frame that was on screen then.
+pub fn resample_map(fmap: &[i32], clip_fps: i32, out_fps: i32) -> Vec<i32> {
+    if fmap.is_empty() || clip_fps <= 0 || out_fps <= 0 || clip_fps == out_fps {
+        return fmap.to_vec();
+    }
+    let n = ((fmap.len() as f64) * (out_fps as f64) / (clip_fps as f64))
+        .round()
+        .max(1.0) as usize;
+    (0..n)
+        .map(|k| {
+            let i = ((k as f64) * (clip_fps as f64) / (out_fps as f64)).floor() as usize;
+            fmap[i.min(fmap.len() - 1)]
+        })
+        .collect()
+}
+
 pub fn build_frame_map(frame_count: i32, fps: i32, edit: &EditList) -> Vec<i32> {
     if edit.trims.is_empty() {
         return (0..frame_count).collect();
@@ -216,4 +237,52 @@ pub fn build_frame_map(frame_count: i32, fps: i32, edit: &EditList) -> Vec<i32> 
         }
     }
     map
+}
+
+#[cfg(test)]
+mod resample_tests {
+    use super::*;
+
+    /// The frame count has to follow the requested rate while the *duration*
+    /// stays put. Getting this wrong is what turned a 30 fps take into a
+    /// double-speed export.
+    #[test]
+    fn rate_change_keeps_the_duration() {
+        let src: Vec<i32> = (0..108).collect();
+        for out in [24, 30, 50, 60, 120] {
+            let got = resample_map(&src, 30, out);
+            let want_s = 108.0 / 30.0;
+            let got_s = got.len() as f64 / out as f64;
+            assert!(
+                (got_s - want_s).abs() <= 1.0 / out as f64 + 1e-9,
+                "30->{out}: {got_len} frames = {got_s}s, want {want_s}s",
+                got_len = got.len()
+            );
+        }
+    }
+
+    #[test]
+    fn same_rate_is_the_identity() {
+        let src = vec![0, 1, 2, 3, 4];
+        assert_eq!(resample_map(&src, 30, 30), src);
+        assert_eq!(resample_map(&src, 60, 60), src);
+    }
+
+    #[test]
+    fn output_stays_inside_the_source_range() {
+        let src: Vec<i32> = (10..40).collect();
+        for out in [12, 24, 60, 240] {
+            let got = resample_map(&src, 30, out);
+            assert!(!got.is_empty());
+            assert!(got[0] >= 10 && *got.last().unwrap() < 40);
+            assert!(got.windows(2).all(|w| w[0] <= w[1]), "must not go backwards");
+        }
+    }
+
+    #[test]
+    fn empty_and_bad_rates_do_not_panic() {
+        assert!(resample_map(&[], 30, 60).is_empty());
+        assert_eq!(resample_map(&[1, 2], 0, 60), vec![1, 2]);
+        assert_eq!(resample_map(&[1, 2], 30, 0), vec![1, 2]);
+    }
 }

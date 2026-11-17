@@ -463,8 +463,13 @@ fn run(
 
     // Spawned lazily, together with the clock, so the trace and the video share
     // their origin no matter how long the encoders take to warm up.
+    // The camera thread owns `track.csv`; joining it is what guarantees the
+    // trace is on disk before anything reads the take back.
+    let cam_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut spawn_camera: Option<Box<dyn FnOnce(Instant) + Send>> = {
         let shared = shared.clone();
+        let cam_slot = cam_handle.clone();
         let s2 = s.clone();
         let stop2 = stop.clone();
         let cursor = cfg.cursor.clone();
@@ -516,8 +521,13 @@ fn run(
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                crate::mc_error!("rec", "启动相机线程失败: {e}");
+            match spawned {
+                Ok(h) => {
+                    if let Ok(mut slot) = cam_slot.lock() {
+                        *slot = Some(h);
+                    }
+                }
+                Err(e) => crate::mc_error!("rec", "启动相机线程失败: {e}"),
             }
         }))
     };
@@ -781,11 +791,18 @@ fn run(
     crate::hud::set_rect(None, "");
     let elapsed = t0_shared.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed); // camera thread
-    std::thread::sleep(Duration::from_millis(20));
+    // Waiting for it actually to finish, rather than hoping 20 ms was enough:
+    // the track buffer is flushed when the thread exits, and a partial
+    // track.csv is the one thing that cannot be reconstructed later.
+    if let Ok(mut slot) = cam_handle.lock() {
+        if let Some(h) = slot.take() {
+            let _ = h.join();
+        }
+    }
     drop(frames_csv);
 
-    let master_code = master.map(|m| m.finish()).unwrap_or(0);
-    let code = camera.finish();
+    let (master_code, master_err) = master.map(|m| m.finish()).unwrap_or((0, String::new()));
+    let (code, camera_err) = camera.finish();
 
     // Audio is folded in after the encoders have closed their files, so a
     // failed mux leaves a perfectly good silent video rather than a broken one.
@@ -818,10 +835,10 @@ fn run(
 
     let mut failure = write_err.or(capture_dead);
     if failure.is_none() && master_code != 0 {
-        failure = Some(format!("原片编码器异常退出 ({master_code})"));
+        failure = Some(format!("原片编码器异常退出 ({master_code}) {master_err}"));
     }
     if failure.is_none() && code != 0 {
-        failure = Some(format!("跟拍编码器异常退出 ({code})"));
+        failure = Some(format!("跟拍编码器异常退出 ({code}) {camera_err}"));
     }
 
     // Written either way: a folder without meta.json is invisible in the

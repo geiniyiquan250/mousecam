@@ -614,6 +614,11 @@ impl Capture {
                 r
             }
         } else if let Some(blt) = self.blt.as_mut() {
+            // Same guard as the duplication path: `grab` is public and a short
+            // buffer would be a silent heap overwrite.
+            if dst.len() < (w as usize) * (h as usize) {
+                return false;
+            }
             if !blt.grab(self.mon, w, h) {
                 return false;
             }

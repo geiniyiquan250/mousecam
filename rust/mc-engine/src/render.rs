@@ -4,7 +4,7 @@
 use crate::camera::{Camera, IRect, Vec2};
 use crate::clip::ClipInfo;
 use crate::cursor::{arrow_sprite, draw, Sprite};
-use crate::edit::{build_frame_map, cursor_at, EditList};
+use crate::edit::{build_frame_map, cursor_at, resample_map, EditList};
 use crate::ffmpeg::{media_duration as _dur, FrameReader, FrameWriter, VideoFormat};
 use crate::resample::Resampler;
 use crate::settings::Settings;
@@ -206,19 +206,7 @@ pub fn render_clip(
     // rate, resample it: each output frame picks the source frame that was on
     // screen at that moment. Writing one output frame per source frame at a
     // different `-r` would change nothing but the playback speed.
-    let src_of_out: Vec<i32> = if s.fps == clip.fps || fmap.is_empty() {
-        fmap.clone()
-    } else {
-        let n = ((fmap.len() as f64) * (s.fps as f64) / (clip.fps as f64))
-            .round()
-            .max(1.0) as usize;
-        (0..n)
-            .map(|k| {
-                let i = ((k as f64) * (clip.fps as f64) / (s.fps as f64)).floor() as usize;
-                fmap[i.min(fmap.len() - 1)]
-            })
-            .collect()
-    };
+    let src_of_out: Vec<i32> = resample_map(&fmap, clip.fps, s.fps);
     let total = src_of_out.len() as i32;
 
     for k in 0..total {
@@ -309,10 +297,17 @@ pub fn render_clip(
         }
     }
 
-    let code = writer.finish();
+    let (code, why) = writer.finish();
     let elapsed = t0.elapsed().as_secs_f64();
     if code != 0 {
-        log_line(&format!("ffmpeg exited with code {code}"));
+        log_line(&format!("ffmpeg exited with code {code}: {why}"));
+        // The file exists but is not a video; keeping it would look like success.
+        let _ = std::fs::remove_file(out);
+        return Err(if why.is_empty() {
+            format!("编码器异常退出 ({code})")
+        } else {
+            format!("编码器异常退出 ({code}): {why}")
+        });
     }
 
     Ok(RenderSummary {

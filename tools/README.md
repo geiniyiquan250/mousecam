@@ -75,6 +75,22 @@ python tools\trackgen.py        # 生成两条轨迹到 target\track-*
 python tools\smooth-bench.py    # 对当前参数打表
 ```
 
+## 推送：`push-via-api.mjs`
+
+有些网络下 `github.com:443` 能建 TCP 连接、却在 HTTPS 握手后被重置，`git push` 会卡到超时，而 `api.github.com` 一直是通的。这个工具就绕开 git 传输层，直接用 GitHub REST API 按 git 对象模型推送（blob → tree → commit → 更新 ref）。
+
+```bat
+node tools\push-via-api.mjs                  :: 预演，只列出要推的提交
+node tools\push-via-api.mjs --yes            :: 真正推送
+node tools\push-via-api.mjs --yes --tag v0.3.0   :: 顺带推一个 tag
+```
+
+**提交 SHA 保持不变。** 重建 commit 时用的是原来的 author 与 committer（含时间戳），所以推完本地和远端指向同一个 SHA，不需要 `git reset`。万一服务端重建了对象，工具会打印需要执行的 `git fetch && git reset --hard`。
+
+Token 取 `GH_TOKEN` / `GITHUB_TOKEN` 环境变量，否则从 `git credential` 里读 `github.com` 的凭据；不落盘。
+
+安全边界：只做快进推送。远端有本地没有的提交时直接拒绝，不会强推。
+
 ## 回归套件
 
 每个套件都应当**在全新的应用实例上跑**，连着跑会互相污染状态（裁切区间、关键帧会残留）。

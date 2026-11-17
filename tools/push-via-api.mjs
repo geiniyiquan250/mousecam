@@ -6,10 +6,12 @@
 // `api.github.com` keeps working. This walks the same commits the way the git
 // wire protocol would - blobs, trees, commits, then the ref - over the API.
 //
-// The commit objects are rebuilt with the original author *and* committer
-// identity and date, so the resulting SHAs match the local ones. That matters:
-// if the SHAs changed on every push, the local branch would drift from the
-// remote for no reason.
+// The commit objects are rebuilt with the original author *and* committer, so a
+// commit made in UTC comes out with the same SHA. GitHub normalises the
+// committer date to +0000, though, so a commit made in another time zone gets a
+// new SHA even though its tree is identical. When that happens this tool moves
+// the local branch onto the new commit, so the two sides stay in step and the
+// working tree does not change at all.
 //
 //   node tools/push-via-api.mjs                  # dry run, shows what would go
 //   node tools/push-via-api.mjs --yes            # actually push
@@ -33,6 +35,7 @@ const REMOTE = opt('--remote', 'origin');
 const BRANCH = opt('--branch', 'main');
 const TAG = opt('--tag', '');
 const YES = flag('--yes');
+const NO_ADOPT = flag('--no-adopt');
 const VERBOSE = flag('--verbose');
 const API = 'https://api.github.com';
 
@@ -229,11 +232,20 @@ await api('PATCH', `/repos/${REPO}/git/refs/heads/${BRANCH}`, { sha: parent });
 console.log(`\n✓ 已推送 ${commits.length} 个提交到 ${REPO}:${BRANCH}`);
 console.log(`  blob ${created} 个，删除 ${deleted} 个，SHA 变化 ${rewritten} 个`);
 
-if (rewritten) {
-  console.log('\n注意：服务端重建了提交，本地需要用下面的命令对齐：');
+if (!rewritten) {
+  console.log('  本地与远端 SHA 一致');
+} else if (NO_ADOPT) {
+  console.log('\n服务端重建了提交，本地需要手动对齐：');
+  console.log(`  git fetch ${REMOTE} && git reset --hard ${REMOTE}/${BRANCH}`);
+} else if (git('status', '--porcelain')) {
+  console.log('\n服务端重建了提交，但工作区有未提交的改动，没有动本地：');
   console.log(`  git fetch ${REMOTE} && git reset --hard ${REMOTE}/${BRANCH}`);
 } else {
-  console.log('  本地与远端 SHA 一致，不需要额外操作');
+  // The tree is byte-identical; only the committer's time zone differs, so
+  // moving the branch onto the new commit leaves every file untouched.
+  git('fetch', REMOTE, BRANCH);
+  git('reset', '--hard', `${REMOTE}/${BRANCH}`);
+  console.log(`✓ 本地已对齐到 ${git('rev-parse', '--short', BRANCH)}（文件内容未变）`);
 }
 
 if (TAG) await pushTag();

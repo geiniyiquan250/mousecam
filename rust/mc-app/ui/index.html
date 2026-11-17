@@ -231,9 +231,14 @@
           </select>
         </label>
         <div class="fhint" id="exHint">输出到素材目录下的 export.*</div>
+        <div class="ex-progress is-hidden" id="exProgress">
+          <div class="ex-bar"><i id="exBarFill"></i></div>
+          <div class="ex-line"><span id="exPercent">0%</span><span id="exFrames"></span></div>
+        </div>
       </div>
       <div class="modal-foot">
         <button class="head-btn" id="exCancel">取消</button>
+        <button class="head-btn ex-stop is-hidden" id="exStop">停止导出</button>
         <button class="head-btn is-on" id="exGo">开始导出</button>
       </div>
     </div>

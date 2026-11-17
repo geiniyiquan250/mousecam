@@ -207,6 +207,16 @@ impl FrameWriter {
     }
 
     /// Closes stdin and waits for ffmpeg to finish.
+    /// Stops the encoder right now. Used when a render is abandoned, where
+    /// closing stdin politely would leave ffmpeg holding the output file open
+    /// for long enough that deleting it fails and a half-written file survives.
+    pub fn abort(mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
     pub fn finish(mut self) -> i32 {
         drop(self.stdin.take());
         match self.child.wait() {

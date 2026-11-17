@@ -141,7 +141,7 @@ pub fn render_clip(
     edit: &EditList,
     fmt: VideoFormat,
     crf: i32,
-    mut progress: impl FnMut(i32, i32),
+    mut progress: impl FnMut(i32, i32) -> bool,
 ) -> Result<RenderSummary, String> {
     let out_w = s.out_width & !1;
     let out_h = s.out_height();
@@ -300,8 +300,12 @@ pub fn render_clip(
             break;
         }
         written += 1;
-        if written % 30 == 0 || written == total {
-            progress(written, total);
+        if (written % 30 == 0 || written == total) && !progress(written, total) {
+            // The caller wants to stop: kill the encoder before touching the
+            // file, then remove it so nothing half-written looks finished.
+            writer.abort();
+            let _ = std::fs::remove_file(out);
+            return Err("导出已取消".into());
         }
     }
 

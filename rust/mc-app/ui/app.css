@@ -831,3 +831,33 @@ body.split-drag * { pointer-events: none; }
   accent-color: var(--accent);
   cursor: pointer;
 }
+
+/* export progress: a bar plus the frame counter, shown only while rendering */
+.ex-progress {
+  margin-top: 10px;
+}
+.ex-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #161d29;
+  overflow: hidden;
+}
+.ex-bar > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #4f8cff, #7aa7ff);
+  transition: width .18s linear;
+}
+.ex-line {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.ex-stop {
+  color: #ffb4a8;
+  border-color: #4a2a26;
+}

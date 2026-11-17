@@ -83,6 +83,30 @@ async fn probe_latest() -> Result<mc_api::ProbeDto, String> {
 }
 
 #[tauri::command]
+async fn load_edit(dir: String) -> Result<mc_api::EditStateDto, String> {
+    tauri::async_runtime::spawn_blocking(move || mc_api::load_edit(dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn save_edit(dir: String, text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || mc_api::save_edit(dir, text))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn export_progress() -> mc_api::ProgressDto {
+    mc_api::export_progress()
+}
+
+#[tauri::command]
+async fn export_cancel() {
+    mc_api::export_cancel();
+}
+
+#[tauri::command]
 async fn viewport_fit(edit: String, monitor: Option<i32>) -> mc_api::FitDto {
     tauri::async_runtime::spawn_blocking(move || mc_api::viewport_fit(edit, monitor))
         .await
@@ -532,6 +556,10 @@ fn main() {
         probe_latest,
         debug_snapshot,
         viewport_fit,
+        load_edit,
+        save_edit,
+        export_progress,
+        export_cancel,
             record_stop,
             record_status,
             render_proxy,

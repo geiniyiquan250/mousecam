@@ -236,6 +236,7 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
             "  \"lookaheadMs\": {:.1},\n",
             "  \"deadZone\": {:.4},\n",
             "  \"cursorSmoothMs\": {:.1},\n",
+            "  \"clickRing\": {},\n",
             // duration/frames are recorded here so loaders never have to probe
             // the file with ffmpeg to find out how long the clip is
             "  \"duration\": {:.6},\n",
@@ -260,6 +261,7 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
         s.lookahead_ms,
         s.dead_zone,
         s.cursor_smooth_ms,
+        if s.click_ring { 1 } else { 0 },
         duration,
         dropped,
         frames

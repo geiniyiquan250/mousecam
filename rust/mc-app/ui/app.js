@@ -842,6 +842,41 @@ function redo() {
   applyEditState(state.redoStack.pop());
 }
 
+// Puts a clip's stored edit back into the UI. Values come out of the engine
+// already resolved (mcl > meta), so the sliders show what the take really used.
+function applyLoadedEdit(st) {
+  Object.assign(state.edit, {
+    zoom: st.zoom,
+    expand: st.expand,
+    threshold: st.threshold,
+    smooth: st.smooth,
+    resp: st.resp,
+    follow: st.follow,
+    look: st.look,
+    aspect: st.aspect,
+    width: st.width,
+    dz: st.dz,
+    cs: st.cs,
+    clk: st.clk,
+  });
+  state.trim = st.trims && st.trims.length ? { a: st.trims[0][0], b: st.trims[0][1] } : null;
+  state.kfs = (st.kfs || []).map(([t, x, y]) => ({ t, x, y }));
+  buildParams('paramsGrid');
+  buildParams('recParamsGrid');
+  saveParams();
+}
+
+// ---------- 3. 写回去（防抖，避免拖动时每帧写盘） ----------
+let saveEditTimer = 0;
+function scheduleSaveEdit() {
+  if (!state.clip) return;
+  clearTimeout(saveEditTimer);
+  saveEditTimer = setTimeout(() => {
+    if (!state.clip) return;
+    invoke('save_edit', { dir: state.clip.dir, text: editText() }).catch(() => {});
+  }, 500);
+}
+
 function scheduleRebake() {
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
@@ -856,6 +891,7 @@ function scheduleRebake() {
 let rebakeTimer = 0;
 function onParamChanged() {
   saveParams();
+  scheduleSaveEdit();
   updateFitHint();
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
@@ -930,14 +966,38 @@ $('exportModal').addEventListener('mousedown', (e) => {
   if (e.target === $('exportModal')) $('exportModal').classList.add('is-hidden');
 });
 
+$('exStop').onclick = () => {
+  invoke('export_cancel').catch(() => {});
+  $('exStop').disabled = true;
+  setTimeout(() => { $('exStop').disabled = false; }, 1200);
+};
+
 $('exGo').onclick = async () => {
   if (!state.clip) return;
   const btn = $('exGo');
+  const stopBtn = $('exStop');
   const openedAt = Date.now();
   btn.disabled = true;
   btn.textContent = '导出中…';
+  stopBtn.classList.remove('is-hidden');
+  $('exProgress').classList.remove('is-hidden');
+  $('exBarFill').style.width = '0%';
+  $('exPercent').textContent = '0%';
+  $('exFrames').textContent = '';
   $('btnExport').disabled = true;
   $('btnExport').textContent = '导出中…';
+
+  const poll = setInterval(async () => {
+    try {
+      const p = await invoke('export_progress');
+      if (!p || !p.active) return;
+      const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+      $('exBarFill').style.width = pct + '%';
+      $('exPercent').textContent = pct + '%';
+      $('exFrames').textContent = p.total ? `${p.done} / ${p.total} 帧` : '';
+    } catch {}
+  }, 250);
+
   try {
     const r = await invoke('export', {
       dir: state.clip.dir,
@@ -952,8 +1012,12 @@ $('exGo').onclick = async () => {
     toast('已导出 ' + r, 4200);
     state.exportFormat = $('exFormat').value;
   } catch (e) {
-    toast('导出失败: ' + e, 5000);
+    const msg = String(e);
+    toast(msg.includes('取消') ? '已取消导出' : '导出失败: ' + msg, 5000);
   } finally {
+    clearInterval(poll);
+    stopBtn.classList.add('is-hidden');
+    $('exProgress').classList.add('is-hidden');
     // keep the button readable for at least a moment on fast exports
     const wait = Math.max(0, 350 - (Date.now() - openedAt));
     setTimeout(() => {
@@ -1002,10 +1066,14 @@ async function selectClip(dir) {
   state.tlPan = null;
   state.proxyReady = false;
   state.proxyStale = false;
-  // trims and keyframes are clip-specific: times from the old clip are
-  // meaningless (or out of range) on the new one
+  // The take carries its own edit (`edit.mcl`), which is also what mc-render
+  // reads; meta.json is the fallback for a clip that was never edited.
   state.trim = null;
   state.kfs = [];
+  try {
+    const st = await invoke('load_edit', { dir: c.dir });
+    if (st) applyLoadedEdit(st);
+  } catch {}
   state.undoStack.length = 0;
   state.redoStack.length = 0;
   $('cropVideo').classList.remove('is-on');
@@ -1799,6 +1867,7 @@ window.addEventListener('mouseup', () => {
 
 let trimTimer = 0;
 function markTrimDirty() {
+  scheduleSaveEdit();
   clearTimeout(trimTimer);
   trimTimer = setTimeout(() => {
     if (state.trim && state.trim.a <= 0.001 && state.trim.b >= (state.clip ? state.clip.duration : 0) - 0.02) {

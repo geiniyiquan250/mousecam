@@ -207,6 +207,17 @@ pub fn settings_from_meta(dir: &Path) -> Result<Settings, String> {
     s.speed_resp = json_num(&meta, "speedResp").unwrap_or(35.0) as f32;
     s.follow_hz = json_num(&meta, "followHz").unwrap_or(2.2) as f32;
     s.lookahead_ms = json_num(&meta, "lookaheadMs").unwrap_or(60.0) as f32;
+    // These were written but never read back, so re-opening a take silently
+    // replaced them with whatever the UI had on its sliders.
+    if let Some(v) = json_num(&meta, "deadZone") {
+        s.dead_zone = (v as f32).clamp(0.0, 0.25);
+    }
+    if let Some(v) = json_num(&meta, "cursorSmoothMs") {
+        s.cursor_smooth_ms = (v as f32).clamp(0.0, 250.0);
+    }
+    if let Some(v) = json_num(&meta, "clickRing") {
+        s.click_ring = v != 0.0;
+    }
     Ok(s)
 }
 

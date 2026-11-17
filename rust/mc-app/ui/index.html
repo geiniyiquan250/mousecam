@@ -172,6 +172,13 @@
         <div class="rec-warn" id="recWarn"></div>
       </div>
       <span class="spacer"></span>
+      <label class="rec-fps" title="录制帧率。60 更顺滑，文件约大一倍，编码占用也更高">
+        <span>帧率</span>
+        <select class="sel-mini" id="recFps">
+          <option value="30">30 fps</option>
+          <option value="60">60 fps</option>
+        </select>
+      </label>
       <label class="chk hw-chk" title="用显卡编码，大幅降低录制时的 CPU 占用">
         <input type="checkbox" id="recHw" /> 硬件编码
       </label>

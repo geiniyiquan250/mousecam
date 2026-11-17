@@ -59,10 +59,11 @@ async fn record_start(
     hw: Option<bool>,
     audio_system: Option<bool>,
     audio_mic: Option<bool>,
+    fps: Option<i32>,
     synthetic: Option<bool>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        mc_api::record_start(edit, monitor, hw, audio_system, audio_mic, synthetic)
+        mc_api::record_start(edit, monitor, hw, audio_system, audio_mic, fps, synthetic)
     })
         .await
         .map_err(|e| format!("record_start thread: {e}"))?

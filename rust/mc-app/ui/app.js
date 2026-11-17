@@ -108,6 +108,7 @@ const state = {
   lastToggle: 0,
   hotkeys: null,
   hw: false,
+  recFps: 30,           // 30 or 60; the capture rate, fixed for the whole take
   nvenc: null,
   appSettings: null,
   recording: false,
@@ -206,7 +207,7 @@ function setRecording(on) {
   $('recTime').classList.toggle('is-recording-time', on);
   $('recHint').textContent = on
     ? '正在录制 — 点击方形按钮停止'
-    : '主显示器 · 30 fps · 同时生成原片 / 跟拍 / 轨迹';
+    : `主显示器 · ${state.recFps} fps · 同时生成原片 / 跟拍 / 轨迹`;
   $('recState').textContent = on ? '录制中' : '待机';
   // The badge lives in the tab bar, so it stays visible on the edit tab:
   // recording is a global state, not a property of one page.
@@ -217,6 +218,9 @@ function setRecording(on) {
   }
   const sel = $('recMonitor');
   if (sel) sel.disabled = on;
+  // The rate is fixed for the whole take, so it cannot change mid-recording.
+  const fpsSel = $('recFps');
+  if (fpsSel) fpsSel.disabled = on;
   paintRecHint();
   if (on) {
     state.recTimer = setInterval(async () => {
@@ -281,6 +285,7 @@ async function toggleRecord() {
         hw: state.hw,
         audioSystem: $('recAudioSys') ? $('recAudioSys').checked : false,
         audioMic: $('recAudioMic') ? $('recAudioMic').checked : false,
+        fps: state.recFps,
       });
       state.recDir = dir;
       $('recTime').textContent = '00:00.0';
@@ -415,6 +420,23 @@ async function saveAudioPrefs() {
   } catch (e) {
     logUi('error', `保存音频开关失败: ${e}`);
     toast('音频开关未能保存');
+  }
+}
+
+// The capture rate survives a restart: it belongs to the machine, not to one
+// take, and a 60 fps habit should not have to be re-chosen every launch.
+try {
+  state.recFps = Number(localStorage.getItem('mc.recFps')) === 60 ? 60 : 30;
+} catch {}
+{
+  const fpsSel = $('recFps');
+  if (fpsSel) {
+    fpsSel.value = String(state.recFps);
+    fpsSel.onchange = () => {
+      state.recFps = Number(fpsSel.value) === 60 ? 60 : 30;
+      try { localStorage.setItem('mc.recFps', String(state.recFps)); } catch {}
+      paintRecHint();
+    };
   }
 }
 
@@ -2451,8 +2473,8 @@ function paintRecHint() {
     ? ` · ${state.hotkeys[1] ? 'F9' : 'Ctrl+Alt+R'} 开始/停止`
     : '';
   $('recHint').textContent = (m
-    ? `${m.label} · 同时生成原片 / 跟拍 / 轨迹`
-    : '主显示器 · 30 fps · 同时生成原片 / 跟拍 / 轨迹') + hk;
+    ? `${m.label} · ${state.recFps} fps · 同时生成原片 / 跟拍 / 轨迹`
+    : `主显示器 · ${state.recFps} fps · 同时生成原片 / 跟拍 / 轨迹`) + hk;
 }
 
 async function loadMonitors() {

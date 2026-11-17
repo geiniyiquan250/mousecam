@@ -794,6 +794,7 @@ pub fn record_start(
     hw: Option<bool>,
     audio_system: Option<bool>,
     audio_mic: Option<bool>,
+    fps: Option<i32>,
     synthetic: Option<bool>,
 ) -> Result<String, String> {
     // None means no explicit choice (the hotkey path): use the saved
@@ -830,6 +831,14 @@ pub fn record_start(
 
     let mut s = Settings::default();
     parse_edit(&edit).cam.apply(&mut s);
+    // The capture rate is chosen on the record page, not carried in the edit
+    // list: a take is captured once, at one rate, and everything downstream
+    // (meta.json, frames.csv, the export's "follow the clip" option) reads it
+    // back from there.
+    if let Some(f) = fps {
+        s.fps = f.clamp(5, 120);
+    }
+    mc_engine::mc_info!("record", "capture rate: {} fps", s.fps);
 
     // GPU encoding keeps the recording near idle; software x264 costs about a
     // core and a half at 1440p30 with two streams running.
@@ -1585,7 +1594,7 @@ fn toggle_recording() {
         let _ = record_stop();
     } else {
         let (edit, mon, hw) = last_start().lock().unwrap().clone();
-        let _ = record_start(edit, mon, hw, None, None, None);
+        let _ = record_start(edit, mon, hw, None, None, None, None);
     }
 }
 

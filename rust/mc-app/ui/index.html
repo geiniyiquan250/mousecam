@@ -24,6 +24,9 @@
       <button class="tab is-active" data-tab="edit">编辑</button>
       <button class="tab" data-tab="record">录制</button>
       <span class="tab-glider" data-tauri-drag-region></span>
+      <span class="rec-badge is-hidden" id="recBadge" title="正在录制，点击回到录制页">
+        <i></i><span id="recBadgeTime">00:00</span>
+      </span>
     </nav>
 
     <div class="winbtns" data-tauri-drag-region>
@@ -48,6 +51,11 @@
 
   <!-- ─── editor surface ────────────────────────────────────── -->
   <main class="stage" id="stageEdit">
+    <div class="empty-cta is-hidden" id="editEmpty">
+      <div class="empty-title">还没有录制素材</div>
+      <div class="empty-sub">录一段之后，这里会出现原片、跟拍视口和时间轴</div>
+      <button class="head-btn is-on" id="emptyGoRecord">去录制一段</button>
+    </div>
 
     <section class="viewports">
       <article class="vp">

@@ -99,7 +99,7 @@ const state = {
   stillInFlight: false,
   stillPending: false,
   dirty: false,
-  trim: null,           // {a, b} seconds on the source timeline, null = whole clip
+  trims: [],            // [{a, b}, ...] kept ranges; empty = whole clip
   kfs: [],              // [{t, x, y}] manual follow points
   kfMode: false,
   trimMode: false,
@@ -188,7 +188,7 @@ function editText() {
     `aspect ${e.aspect}`,
     `width ${e.width}`,
   ];
-  if (state.trim) lines.push(`trim ${state.trim.a.toFixed(3)} ${state.trim.b.toFixed(3)}`);
+  for (const t of state.trims) lines.push(`trim ${t.a.toFixed(3)} ${t.b.toFixed(3)}`);
   for (const k of state.kfs) lines.push(`kf ${k.t.toFixed(3)} ${Math.round(k.x)} ${Math.round(k.y)}`);
   return lines.join('\n');
 }
@@ -208,6 +208,13 @@ function setRecording(on) {
     ? '正在录制 — 点击方形按钮停止'
     : '主显示器 · 30 fps · 同时生成原片 / 跟拍 / 轨迹';
   $('recState').textContent = on ? '录制中' : '待机';
+  // The badge lives in the tab bar, so it stays visible on the edit tab:
+  // recording is a global state, not a property of one page.
+  const badge = $('recBadge');
+  if (badge) {
+    badge.classList.toggle('is-hidden', !on);
+    if (!on) $('recBadgeTime').textContent = '00:00';
+  }
   const sel = $('recMonitor');
   if (sel) sel.disabled = on;
   paintRecHint();
@@ -215,7 +222,11 @@ function setRecording(on) {
     state.recTimer = setInterval(async () => {
       try {
         const st = await invoke('record_status');
-        if (st && st.recording) $('recTime').textContent = fmtRecTime(st.elapsed);
+        if (st && st.recording) {
+          $('recTime').textContent = fmtRecTime(st.elapsed);
+          const bt = $('recBadgeTime');
+          if (bt) bt.textContent = fmtRecTime(st.elapsed);
+        }
       } catch {}
     }, 200);
   } else {
@@ -804,7 +815,7 @@ function buildParams(target) {
 // A snapshot of everything an edit can touch. Strings keep it trivial to
 // compare and impossible to get subtly wrong in the way per-action inverses are.
 function editState() {
-  return JSON.stringify({ trim: state.trim, kfs: state.kfs, edit: state.edit });
+  return JSON.stringify({ trims: state.trims, kfs: state.kfs, edit: state.edit });
 }
 
 function pushUndo() {
@@ -817,7 +828,7 @@ function pushUndo() {
 
 function applyEditState(json) {
   const o = JSON.parse(json);
-  state.trim = o.trim;
+  state.trims = o.trims || [];
   state.kfs = o.kfs || [];
   Object.assign(state.edit, o.edit || {});
   buildParams('paramsGrid');
@@ -859,7 +870,7 @@ function applyLoadedEdit(st) {
     cs: st.cs,
     clk: st.clk,
   });
-  state.trim = st.trims && st.trims.length ? { a: st.trims[0][0], b: st.trims[0][1] } : null;
+  state.trims = (st.trims || []).map(([a, b]) => ({ a, b }));
   state.kfs = (st.kfs || []).map(([t, x, y]) => ({ t, x, y }));
   buildParams('paramsGrid');
   buildParams('recParamsGrid');
@@ -933,11 +944,15 @@ $('trimToggle').onclick = () => {
   state.trimMode = !state.trimMode;
   $('trimToggle').classList.toggle('is-on', state.trimMode);
   document.getElementById('tlCanvas').style.cursor = state.trimMode ? 'crosshair' : '';
-  if (state.trimMode) toast('在时间线上拖动框选要保留的区间', 2600);
+  if (state.trimMode) {
+    toast('拖动框选要保留的区间；可多段，双击某段删除', 3000);
+  }
 };
 
 $('btnTrimClear').onclick = () => {
-  state.trim = null;
+  pushUndo();
+  state.trims = [];
+  scheduleSaveEdit();
   drawTimeline();
   drawLeft();
 };
@@ -1068,7 +1083,7 @@ async function selectClip(dir) {
   state.proxyStale = false;
   // The take carries its own edit (`edit.mcl`), which is also what mc-render
   // reads; meta.json is the fallback for a clip that was never edited.
-  state.trim = null;
+  state.trims = [];
   state.kfs = [];
   try {
     const st = await invoke('load_edit', { dir: c.dir });
@@ -1090,8 +1105,12 @@ async function loadClips() {
   if (!state.clips.length) {
     $('viewEmpty').textContent = '没有找到录制素材';
     $('clipSel').style.display = 'none';
+    const empty = $('editEmpty');
+    if (empty) empty.classList.remove('is-hidden');
     return false;
   }
+  const empty = $('editEmpty');
+  if (empty) empty.classList.add('is-hidden');
   fillClipSelect();
   state.clip = state.clips[0];
   $('monInfo').textContent = `${state.clip.mon_w}×${state.clip.mon_h} · ${state.clip.fps}fps`;
@@ -1512,9 +1531,36 @@ function xToTime(g, x) {
 
 const TRIM_HIT = 10;
 
-function trimHandles(g) {
-  if (!state.trim) return null;
-  return { a: timeToX(g, state.trim.a), b: timeToX(g, state.trim.b) };
+// Pixel edges for every kept range, in the same order as `state.trims`.
+function trimEdges(g) {
+  return state.trims.map((t) => ({ a: timeToX(g, t.a), b: timeToX(g, t.b) }));
+}
+
+// Keeps the ranges ordered, inside the clip and free of overlaps, so the
+// engine sees a sane list however the pointer was dragged.
+function normalizeTrims() {
+  const dur = state.clip ? state.clip.duration : Infinity;
+  const fps = state.bake ? state.bake.fps : 30;
+  const minGap = 3 / fps;
+  const list = state.trims
+    .map((t) => ({ a: Math.max(0, Math.min(t.a, t.b)), b: Math.min(dur, Math.max(t.a, t.b)) }))
+    .filter((t) => t.b - t.a >= minGap)
+    .sort((x, y) => x.a - y.a);
+  const merged = [];
+  for (const t of list) {
+    const last = merged[merged.length - 1];
+    if (last && t.a <= last.b + 1e-6) {
+      last.b = Math.max(last.b, t.b);
+    } else {
+      merged.push({ a: t.a, b: t.b });
+    }
+  }
+  state.trims = merged;
+}
+
+// Total kept seconds.
+function trimTotal() {
+  return state.trims.reduce((sum, t) => sum + Math.max(0, t.b - t.a), 0);
 }
 
 function drawTimeline() {
@@ -1585,24 +1631,30 @@ function drawTimeline() {
     }
   }
 
-  // ---- trim region
-  const hs = trimHandles(g);
-  if (hs) {
+  // ---- trim regions
+  const edges = trimEdges(g);
+  if (edges.length) {
     ctx.save();
+    // everything is dimmed, then each kept range is lit back up
     ctx.fillStyle = 'rgba(5,7,10,.55)';
-    ctx.fillRect(g.x0, laneY, hs.a - g.x0, laneH);
-    ctx.fillRect(hs.b, laneY, g.x1 - hs.b, laneH);
+    ctx.fillRect(g.x0, laneY, g.x1 - g.x0, laneH);
+    ctx.fillStyle = 'rgba(46,230,168,.10)';
+    for (const e of edges) {
+      ctx.fillRect(e.a, laneY, Math.max(1, e.b - e.a), laneH);
+    }
     ctx.restore();
 
     ctx.strokeStyle = 'rgba(46,230,168,.9)';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(hs.a, laneY - 2); ctx.lineTo(hs.a, laneY + laneH + 2);
-    ctx.moveTo(hs.b, laneY - 2); ctx.lineTo(hs.b, laneY + laneH + 2);
+    for (const e of edges) {
+      ctx.moveTo(e.a, laneY - 2); ctx.lineTo(e.a, laneY + laneH + 2);
+      ctx.moveTo(e.b, laneY - 2); ctx.lineTo(e.b, laneY + laneH + 2);
+    }
     ctx.stroke();
 
     // grips
-    for (const x of [hs.a, hs.b]) {
+    for (const x of edges.flatMap((e) => [e.a, e.b])) {
       ctx.fillStyle = '#2ee6a8';
       roundRect(ctx, x - 3.5, laneY + laneH / 2 - 9, 7, 18, 3);
       ctx.fill();
@@ -1643,18 +1695,19 @@ function drawTimeline() {
   const tin = $('trimIn');
   const tout = $('trimOut');
   if (tin && tout) {
-    const on = !!state.trim;
+    const first = state.trims[0];
+    const on = !!first;
     tin.style.opacity = on ? '' : '0.35';
     tout.style.opacity = on ? '' : '0.35';
-    tin.textContent = tc(on ? state.trim.a : 0);
-    tout.textContent = tc(on ? state.trim.b : (state.clip ? state.clip.duration : 0));
+    tin.textContent = tc(on ? first.a : 0);
+    tout.textContent = tc(on ? first.b : (state.clip ? state.clip.duration : 0));
   }
   const tcEl = $('trimChip');
   if (tcEl) {
-    if (state.trim) {
-      const kept = state.trim.b - state.trim.a;
+    if (state.trims.length) {
       tcEl.style.display = '';
-      tcEl.textContent = `保留 ${tc(kept)}`;
+      const n = state.trims.length;
+      tcEl.textContent = `保留 ${tc(trimTotal())}` + (n > 1 ? ` · ${n} 段` : '');
     } else {
       tcEl.style.display = 'none';
     }
@@ -1758,32 +1811,40 @@ tlCanvas.addEventListener('mousedown', (ev) => {
   const r = tlCanvas.getBoundingClientRect();
   const x = ev.clientX - r.left;
   const g = tlGeom();
-  const hs = trimHandles(g);
 
   // middle button drags the window sideways, so a long clip can be inspected
   // at a zoom level where one pixel is one frame
   if (ev.button === 1) {
     ev.preventDefault();
-    tlDrag = 'pan';
+    tlDrag = { kind: 'pan' };
     panAnchorX = x;
     panStart = g.start;
     return;
   }
 
-  if (hs) {
-    if (Math.abs(x - hs.a) <= TRIM_HIT) { pushUndo(); tlDrag = 'a'; return; }
-    if (Math.abs(x - hs.b) <= TRIM_HIT) { pushUndo(); tlDrag = 'b'; return; }
+  const edges = trimEdges(g);
+  for (let i = 0; i < edges.length; i++) {
+    if (Math.abs(x - edges[i].a) <= TRIM_HIT) {
+      pushUndo();
+      tlDrag = { kind: 'edge', i, which: 'a' };
+      return;
+    }
+    if (Math.abs(x - edges[i].b) <= TRIM_HIT) {
+      pushUndo();
+      tlDrag = { kind: 'edge', i, which: 'b' };
+      return;
+    }
   }
   if (state.trimMode) {
     pushUndo();
-    tlDrag = 'new';
-    const t = xToTime(g, x);
-    state.trim = { a: t, b: t };
+    const t = snapTime(xToTime(g, x));
+    state.trims.push({ a: t, b: t });
+    tlDrag = { kind: 'new', i: state.trims.length - 1 };
     tlDragAnchor = t;
     drawTimeline();
     return;
   }
-  tlDrag = 'seek';
+  tlDrag = { kind: 'seek' };
   seekTo(x);
 });
 
@@ -1803,18 +1864,25 @@ tlCanvas.addEventListener('wheel', (ev) => {
   drawLeft();
 }, { passive: false });
 
-tlCanvas.addEventListener('dblclick', () => {
-  state.trim = null;
+tlCanvas.addEventListener('dblclick', (ev) => {
+  const r = tlCanvas.getBoundingClientRect();
+  const t = xToTime(tlGeom(), ev.clientX - r.left);
+  const i = state.trims.findIndex((x) => t >= x.a && t <= x.b);
+  if (i < 0) return;
+  pushUndo();
+  state.trims.splice(i, 1);
+  normalizeTrims();
   drawTimeline();
   drawLeft();
+  markTrimDirty();
 });
 
 window.addEventListener('mousemove', (ev) => {
   if (!tlDrag) return;
   const r = tlCanvas.getBoundingClientRect();
   const x = ev.clientX - r.left;
-  if (tlDrag === 'seek') { seekTo(x); return; }
-  if (tlDrag === 'pan') {
+  if (tlDrag.kind === 'seek') { seekTo(x); return; }
+  if (tlDrag.kind === 'pan') {
     const g = tlGeom();
     const perPx = g.span / Math.max(1, g.x1 - g.x0);
     const start = panStart - (x - panAnchorX) * perPx;
@@ -1828,34 +1896,49 @@ window.addEventListener('mousemove', (ev) => {
   const fps = state.bake ? state.bake.fps : 30;
   const minGap = 3 / fps;
 
-  if (tlDrag === 'new') {
+  if (tlDrag.kind === 'new') {
+    const range = state.trims[tlDrag.i];
+    if (!range) return;
     const ta = snapTime(tlDragAnchor);
     const tb = snapTime(t);
-    state.trim = { a: Math.min(ta, tb), b: Math.max(ta, tb) };
+    range.a = Math.min(ta, tb);
+    range.b = Math.max(ta, tb);
     state.dragHint = { t: tb };
     seekToTime(tb, { noStill: true });
+    drawTimeline();
+    drawLeft();
     return;
   }
 
-  if (!state.trim) state.trim = { a: 0, b: g.dur };
+  const range = state.trims[tlDrag.i];
+  if (!range) return;
   const snapped = snapTime(t);
-  if (tlDrag === 'a') {
-    state.trim.a = Math.min(Math.max(0, snapped), state.trim.b - minGap);
+  if (tlDrag.which === 'a') {
+    range.a = Math.min(Math.max(0, snapped), range.b - minGap);
   } else {
-    state.trim.b = Math.max(Math.min(g.dur, snapped), state.trim.a + minGap);
+    range.b = Math.max(Math.min(g.dur, snapped), range.a + minGap);
   }
   // the frame under the handle is the one being chosen, so show it
-  state.dragHint = { t: tlDrag === 'a' ? state.trim.a : state.trim.b };
+  state.dragHint = { t: tlDrag.which === 'a' ? range.a : range.b };
   seekToTime(state.dragHint.t, { noStill: true });
+  drawTimeline();
+  drawLeft();
 });
 
 window.addEventListener('mouseup', () => {
-  if (tlDrag === 'new' && state.trim) {
+  if (tlDrag && tlDrag.kind === 'new') {
+    // a click without a drag should not leave a zero-length range behind
     const fps = state.bake ? state.bake.fps : 30;
-    if (state.trim.b - state.trim.a < 3 / fps) state.trim = null;
+    const range = state.trims[tlDrag.i];
+    if (range && range.b - range.a < 3 / fps) state.trims.splice(tlDrag.i, 1);
+    normalizeTrims();
     drawTimeline();
     drawLeft();
-  } else if (tlDrag && tlDrag !== 'seek' && tlDrag !== 'pan') {
+    markTrimDirty();
+  } else if (tlDrag && tlDrag.kind === 'edge') {
+    normalizeTrims();
+    drawTimeline();
+    drawLeft();
     markTrimDirty();
   }
   if (state.dragHint) {
@@ -1870,8 +1953,12 @@ function markTrimDirty() {
   scheduleSaveEdit();
   clearTimeout(trimTimer);
   trimTimer = setTimeout(() => {
-    if (state.trim && state.trim.a <= 0.001 && state.trim.b >= (state.clip ? state.clip.duration : 0) - 0.02) {
-      state.trim = null;   // full range == no trim
+    const dur = state.clip ? state.clip.duration : 0;
+    const full = state.trims.length === 1
+      && state.trims[0].a <= 0.001
+      && state.trims[0].b >= dur - 0.02;
+    if (full) {
+      state.trims = [];   // the whole clip kept == no trim
       drawTimeline();
     }
   }, 50);
@@ -2138,25 +2225,38 @@ $('tcNow').ondblclick = () => {
 
 for (const [id, which] of [['trimIn', 'a'], ['trimOut', 'b']]) {
   $(id).ondblclick = () => {
-    if (!state.trim) {
+    const first = state.trims[0];
+    if (!first) {
       toast('先框选一段要保留的区间');
       return;
     }
-    editTimeInline($(id), state.trim[which], (v) => {
+    editTimeInline($(id), first[which], (v) => {
       pushUndo();
       const fps = state.bake ? state.bake.fps : 30;
       const dur = state.clip ? state.clip.duration : v;
-      if (which === 'a') state.trim.a = Math.max(0, Math.min(v, state.trim.b - 3 / fps));
-      else state.trim.b = Math.min(dur, Math.max(v, state.trim.a + 3 / fps));
+      const target = state.trims[0];
+      if (!target) return;
+      if (which === 'a') target.a = Math.max(0, Math.min(v, target.b - 3 / fps));
+      else target.b = Math.min(dur, Math.max(v, target.a + 3 / fps));
+      normalizeTrims();
       drawTimeline();
       drawLeft();
       markTrimDirty();
-      seekToTime(which === 'a' ? state.trim.a : state.trim.b);
+      const after = state.trims[0] || target;
+      seekToTime(which === 'a' ? after.a : after.b);
     });
   };
 }
 
 $('btnProxy').onclick = generateProxy;
+
+$('emptyGoRecord').onclick = () => {
+  document.querySelector('.tab[data-tab="record"]').click();
+};
+
+$('recBadge').onclick = () => {
+  document.querySelector('.tab[data-tab="record"]').click();
+};
 
 /* ---------------- resize ---------------- */
 let rzTimer = 0;
@@ -2388,7 +2488,7 @@ async function enterRecordTab() {
     $('hudToggle').classList.toggle('is-on', !!on);
   } catch {}
   $('recEmpty').style.display = '';
-  $('recState').textContent = '待机';
+  $('recState').textContent = state.recording ? '录制中' : '待机';
   try {
     if (!monitorsLoaded) await loadMonitors();
     try {

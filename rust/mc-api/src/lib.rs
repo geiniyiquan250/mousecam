@@ -587,6 +587,102 @@ pub fn still(dir: String, edit: String, frame: i32, max_w: u32, kind: String) ->
     }
 }
 
+/// Live state of a render, so the UI can show a bar and offer a cancel.
+static EXPORT_DONE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static EXPORT_TOTAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static EXPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EXPORT_CANCEL: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize)]
+pub struct ProgressDto {
+    pub active: bool,
+    pub done: i32,
+    pub total: i32,
+}
+
+pub fn export_progress() -> ProgressDto {
+    ProgressDto {
+        active: EXPORT_ACTIVE.load(Ordering::Relaxed),
+        done: EXPORT_DONE.load(Ordering::Relaxed),
+        total: EXPORT_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+pub fn export_cancel() {
+    if EXPORT_ACTIVE.load(Ordering::Relaxed) {
+        EXPORT_CANCEL.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The edit that belongs to one take, as the UI's own shape.
+///
+/// `edit.mcl` is the authority when it exists - it is what `mc-render` picks up
+/// too, so the GUI and the CLI agree on what a clip looks like. Without one the
+/// values come from meta.json, which is why they survive a restart at all.
+#[derive(Serialize)]
+pub struct EditStateDto {
+    pub source: String,
+    pub zoom: f32,
+    pub expand: f32,
+    pub threshold: f32,
+    pub smooth: f32,
+    pub resp: f32,
+    pub follow: f32,
+    pub look: f32,
+    pub aspect: i32,
+    pub width: i32,
+    pub dz: f32,
+    pub cs: f32,
+    pub clk: i32,
+    pub trims: Vec<[f64; 2]>,
+    pub kfs: Vec<[f64; 3]>,
+}
+
+pub fn load_edit(dir: String) -> Result<EditStateDto, String> {
+    let p = std::path::PathBuf::from(&dir);
+    let mut s = mc_engine::clip::settings_from_meta(&p).unwrap_or_default();
+    let mcl = p.join("edit.mcl");
+    let (source, edit) = if mcl.is_file() {
+        let text = std::fs::read_to_string(&mcl).map_err(|e| format!("读取 edit.mcl 失败: {e}"))?;
+        ("mcl".to_string(), Some(parse_edit(&text)))
+    } else {
+        ("meta".to_string(), None)
+    };
+    let mut trims = Vec::new();
+    let mut kfs = Vec::new();
+    if let Some(e) = &edit {
+        e.cam.apply(&mut s);
+        trims = e.trims.iter().map(|t| [t.0, t.1]).collect();
+        kfs = e.kf.iter().map(|k| [k.t, k.x as f64, k.y as f64]).collect();
+    }
+    Ok(EditStateDto {
+        source,
+        zoom: s.zoom,
+        expand: s.speed_expand,
+        threshold: s.speed_threshold,
+        smooth: s.smooth,
+        resp: s.speed_resp,
+        follow: s.follow_hz,
+        look: s.lookahead_ms,
+        aspect: s.aspect_idx as i32,
+        width: s.out_width,
+        dz: (s.dead_zone * 100.0 * 10.0).round() / 10.0,
+        cs: s.cursor_smooth_ms,
+        clk: if s.click_ring { 1 } else { 0 },
+        trims,
+        kfs,
+    })
+}
+
+/// Writes `edit.mcl` next to the take, atomically so a crash cannot leave half
+/// a file that `mc-render` would then parse.
+pub fn save_edit(dir: String, text: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&dir).join("edit.mcl");
+    let tmp = p.with_extension("mcl.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写入 edit.mcl 失败: {e}"))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("替换 edit.mcl 失败: {e}"))
+}
+
 pub fn export(
     dir: String,
     edit: String,
@@ -619,7 +715,11 @@ pub fn export(
     } else {
         PathBuf::from(out)
     };
-    let sum = mc_engine::render_clip(
+    EXPORT_DONE.store(0, Ordering::Relaxed);
+    EXPORT_TOTAL.store(0, Ordering::Relaxed);
+    EXPORT_CANCEL.store(false, Ordering::Relaxed);
+    EXPORT_ACTIVE.store(true, Ordering::Relaxed);
+    let rendered = mc_engine::render_clip(
         &clip,
         &ff,
         &out_path,
@@ -627,8 +727,38 @@ pub fn export(
         &e,
         fmt,
         crf,
-        |_, _| {},
-    )?;
+        |done, total| {
+            EXPORT_DONE.store(done, Ordering::Relaxed);
+            EXPORT_TOTAL.store(total, Ordering::Relaxed);
+            !EXPORT_CANCEL.load(Ordering::Relaxed)
+        },
+    );
+    EXPORT_ACTIVE.store(false, Ordering::Relaxed);
+    let sum = rendered?;
+
+    // The frames were written without sound (`FrameWriter` pipes raw video), so
+    // the take's audio has to be attached afterwards - otherwise trimming or
+    // changing the frame size silently produces a mute file.
+    let audio: Vec<PathBuf> = ["audio_system.wav", "audio_mic.wav"]
+        .iter()
+        .map(|n| PathBuf::from(&dir).join(n))
+        .filter(|p| p.is_file() && p.metadata().map(|m| m.len() > 1024).unwrap_or(false))
+        .collect();
+    let ext = sum
+        .out_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !audio.is_empty() && ext != "gif" {
+        // one kept range: the sound starts where the picture starts
+        let at = e.trims.first().map(|t| t.0).unwrap_or(0.0);
+        let dur = sum.frames as f64 / s.fps as f64;
+        if let Err(err) = mc_engine::ffmpeg::mux_audio(&ff, &sum.out_path, &audio, at, Some(dur)) {
+            mc_engine::mc_warn!("export", "封装音频失败: {err}");
+        } else {
+            mc_engine::mc_info!("export", "已加入 {} 条音轨，起点 {at:.3}s", audio.len());
+        }
+    }
     // Show the result where it landed: exporting is the end of a long session
     // and hunting for the file in a captures folder is pure friction.
     #[cfg(windows)]
@@ -677,6 +807,7 @@ pub fn record_start(
     hw: Option<bool>,
     audio_system: Option<bool>,
     audio_mic: Option<bool>,
+    fps: Option<i32>,
     synthetic: Option<bool>,
 ) -> Result<String, String> {
     // None means no explicit choice (the hotkey path): use the saved
@@ -713,6 +844,14 @@ pub fn record_start(
 
     let mut s = Settings::default();
     parse_edit(&edit).cam.apply(&mut s);
+    // The capture rate is chosen on the record page, not carried in the edit
+    // list: a take is captured once, at one rate, and everything downstream
+    // (meta.json, frames.csv, the export's "follow the clip" option) reads it
+    // back from there.
+    if let Some(f) = fps {
+        s.fps = f.clamp(5, 120);
+    }
+    mc_engine::mc_info!("record", "capture rate: {} fps", s.fps);
 
     // GPU encoding keeps the recording near idle; software x264 costs about a
     // core and a half at 1440p30 with two streams running.
@@ -1026,7 +1165,7 @@ pub fn render_proxy(dir: String, edit: String, height: u32) -> Result<String, St
         &e,
         mc_engine::ffmpeg::VideoFormat::Mp4H264,
         30,
-        |_, _| {},
+        |_, _| true,
     )?;
     Ok(out.display().to_string())
 }
@@ -1125,9 +1264,20 @@ pub fn recover_orphan_clips() -> usize {
         let duration = find_ffmpeg()
             .map(|ff| mc_engine::ffmpeg::media_duration(&ff, &master))
             .unwrap_or(0.0);
+        // The header line is not a frame, and the frame rate has to come from the
+        // data: assuming 30 fps for a 60 fps take bends every timestamp in it.
         let frames = std::fs::read_to_string(dir.join("frames.csv"))
-            .map(|t| t.lines().count())
+            .map(|t| {
+                t.lines()
+                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                    .count()
+            })
             .unwrap_or(0);
+        let fps = if duration > 0.5 && frames > 1 {
+            (((frames as f64 - 1.0) / duration).round() as i32).clamp(5, 120)
+        } else {
+            30
+        };
         let meta = format!(
             concat!(
                 "{{\n",
@@ -1135,7 +1285,7 @@ pub fn recover_orphan_clips() -> usize {
                 "  \"recovered\": true,\n",
                 "  \"complete\": false,\n",
                 "  \"monitor\": {{\"x\": {}, \"y\": {}, \"w\": {}, \"h\": {}}},\n",
-                "  \"fps\": 30,\n",
+                "  \"fps\": {},\n",
                 "  \"outWidth\": 1080,\n",
                 "  \"outHeight\": 608,\n",
                 "  \"aspectIdx\": 0,\n",
@@ -1144,7 +1294,7 @@ pub fn recover_orphan_clips() -> usize {
                 "  \"frames\": {}\n",
                 "}}\n"
             ),
-            mon.x, mon.y, mon.w, mon.h, duration, frames.max(1)
+            mon.x, mon.y, mon.w, mon.h, fps, duration, frames.max(1)
         );
         if std::fs::write(dir.join("meta.json"), meta).is_ok() {
             recovered += 1;
@@ -1457,7 +1607,7 @@ fn toggle_recording() {
         let _ = record_stop();
     } else {
         let (edit, mon, hw) = last_start().lock().unwrap().clone();
-        let _ = record_start(edit, mon, hw, None, None, None);
+        let _ = record_start(edit, mon, hw, None, None, None, None);
     }
 }
 

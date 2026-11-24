@@ -212,6 +212,12 @@ impl Dda {
             }
             let _ = self.dup.ReleaseFrame();
             if !copied {
+                // A colour format we cannot convert means the copy never
+                // happened. Reporting the previous frame as a fresh one would
+                // record a still image and call it a successful take.
+                if self.unsupported_format.is_some() {
+                    return false;
+                }
                 return self.have_frame;
             }
 
@@ -608,6 +614,11 @@ impl Capture {
                 r
             }
         } else if let Some(blt) = self.blt.as_mut() {
+            // Same guard as the duplication path: `grab` is public and a short
+            // buffer would be a silent heap overwrite.
+            if dst.len() < (w as usize) * (h as usize) {
+                return false;
+            }
             if !blt.grab(self.mon, w, h) {
                 return false;
             }

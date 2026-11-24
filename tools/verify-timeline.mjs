@@ -83,7 +83,7 @@ const GEOM = `(() => {
     if (t && t.classList.contains('is-on')) t.click();
     const k = document.getElementById('kfToggle');
     if (k && k.classList.contains('is-on')) k.click();
-    window.__mc.trim = null;
+    window.__mc.trims = [];
     window.__mc.kfs = [];
     window.__mc.frame = 0;
     window.__mc.zoom = 0;
@@ -161,17 +161,17 @@ const GEOM = `(() => {
   // ---------- 5) switching clips clears trims and keyframes
   const nClips = await cdp.eval(`document.getElementById('clipSel').options.length`);
   if (nClips > 1) {
-    await cdp.eval(`(() => { window.__mc.trim = { a: 0.4, b: 0.9 }; window.__mc.kfs = [{ t: 0.5, x: 10, y: 10 }]; })()`);
+    await cdp.eval(`(() => { window.__mc.trims = [{ a: 0.4, b: 0.9 }]; window.__mc.kfs = [{ t: 0.5, x: 10, y: 10 }]; })()`);
     const res = await cdp.eval(`(async () => {
       const o = document.getElementById('clipSel');
       const other = [...o.options].find(x => x.value !== window.__mc.clip.dir);
       o.value = other.value;
       o.dispatchEvent(new Event('change'));
       await new Promise(r => setTimeout(r, 1600));
-      return JSON.stringify({ trim: window.__mc.trim, kfs: window.__mc.kfs.length, dur: window.__mc.clip.duration });
+      return JSON.stringify({ trims: window.__mc.trims.length, kfs: window.__mc.kfs.length, dur: window.__mc.clip.duration });
     })()`);
     const r = JSON.parse(res);
-    check('切换素材清空裁切/关键帧', r.trim === null && r.kfs === 0, res);
+    check('切换素材清空裁切/关键帧', r.trims === 0 && r.kfs === 0, res);
   } else {
     check('切换素材清空裁切/关键帧', true, '仅一个素材，跳过');
   }

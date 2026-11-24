@@ -251,6 +251,7 @@ fn main() {
                     (done as f64 / settings.fps as f64) / el.max(1e-6)
                 );
             }
+            true
         },
     );
 

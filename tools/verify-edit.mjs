@@ -116,7 +116,7 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
   // ---------- 1) trim by dragging ----------
   // A trim left by an earlier run puts its grips under the drag起点, and the
   // mousedown then edits that handle instead of starting a new range.
-  await cdp.eval(`(() => { window.__mc.trim = null; })()`);
+  await cdp.eval(`(() => { window.__mc.trims = []; })()`);
   await sleep(200);
   await cdp.eval(`(() => { const b = document.getElementById('trimToggle');
     if (!b.classList.contains('is-on')) b.click(); })()`);
@@ -125,7 +125,7 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
   const ly = tl.y + tl.h * 0.62;
   await drag(cdp, tl.x + tl.w * 0.3, ly, tl.x + tl.w * 0.7, ly);
   await sleep(500);
-  const trim = await cdp.eval(`JSON.stringify(window.__mc.trim)`);
+  const trim = await cdp.eval(`JSON.stringify(window.__mc.trims[0] || null)`);
   const chip = await cdp.eval(`document.getElementById('trimChip').style.display !== 'none'`);
   const t = JSON.parse(trim || 'null');
   check('拖拽创建裁切区间', !!t && t.b - t.a > 0.3, trim);
@@ -206,7 +206,7 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
       const e = window.__mc.edit;
       const lines = ['zoom '+e.zoom,'expand '+e.expand,'threshold '+e.threshold,'smooth '+e.smooth,
                      'resp '+e.resp,'follow '+e.follow,'look '+e.look,'aspect '+e.aspect,'width '+e.width];
-      if (window.__mc.trim) lines.push('trim '+window.__mc.trim.a.toFixed(3)+' '+window.__mc.trim.b.toFixed(3));
+      for (const t of window.__mc.trims) lines.push('trim '+t.a.toFixed(3)+' '+t.b.toFixed(3));
       return lines.join('\\n');
     })(), out: '', format: 'mp4_h264', quality: 18, width: 0, fps: 0 });
     return r;
@@ -224,7 +224,7 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
     if (b.classList.contains('is-on')) b.click();
     const k = document.getElementById('kfToggle');
     if (k && k.classList.contains('is-on')) k.click();
-    window.__mc.trim = null;
+    window.__mc.trims = [];
     window.__mc.kfs = [];
   })()`);
   await sleep(250);

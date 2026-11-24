@@ -152,7 +152,7 @@ html, body {
 
 /* editor: viewports / timeline / params, both dividers draggable */
 #stageEdit {
-  grid-template-rows: minmax(120px, 1fr) 8px var(--tl-h, 104px) 8px var(--params-h, 176px);
+  grid-template-rows: minmax(120px, 1fr) 8px var(--tl-h, 104px) 8px var(--params-h, 200px);
 }
 
 /* recorder: preview / control bar / params */
@@ -830,4 +830,100 @@ body.split-drag * { pointer-events: none; }
   height: 16px;
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+/* export progress: a bar plus the frame counter, shown only while rendering */
+.ex-progress {
+  margin-top: 10px;
+}
+.ex-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #161d29;
+  overflow: hidden;
+}
+.ex-bar > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #4f8cff, #7aa7ff);
+  transition: width .18s linear;
+}
+.ex-line {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.ex-stop {
+  color: #ffb4a8;
+  border-color: #4a2a26;
+}
+
+/* recording is a global state: the badge follows you to the edit tab */
+.rec-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(255, 90, 74, .14);
+  border: 1px solid rgba(255, 90, 74, .38);
+  color: #ff8d7e;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.rec-badge > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ff5a4a;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+/* first run: an empty editor is a dead end without a way out */
+.empty-cta {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  background: var(--bg);
+  z-index: 5;
+}
+.empty-title {
+  font-size: 15px;
+  color: var(--text);
+}
+.empty-sub {
+  font-size: 12px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+
+/* `display` in these blocks would otherwise outrank .is-hidden, which is
+   defined earlier: an invisible overlay that still eats every click. */
+.empty-cta.is-hidden,
+.rec-badge.is-hidden {
+  display: none;
+}
+
+.rec-fps {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--dim);
+  margin-right: 4px;
 }

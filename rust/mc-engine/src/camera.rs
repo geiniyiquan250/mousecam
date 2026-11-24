@@ -473,6 +473,7 @@ mod cursor_scale {
     use super::growth_factor;
 
 
+    #[test]
     fn resting_viewport_does_not_scale_the_cursor() {
         // src_w equals out_w/zoom, i.e. no speed expansion
         assert!((growth_factor(1080.0, 1080, 1.0) - 1.0).abs() < 1e-6);

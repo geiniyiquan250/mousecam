@@ -215,57 +215,6 @@ fn now_stamp() -> String {
     }
 }
 
-/// Folds the captured tracks into an already-encoded video, straight-copying the
-/// picture so only the audio is re-encoded. `-af apad` plus `-shortest` make the
-/// video govern the length: the audio is padded rather than cutting the picture.
-fn mux_audio(ffmpeg: &Path, video: &Path, tracks: &[std::path::PathBuf]) -> Result<(), String> {
-    if tracks.is_empty() || !video.exists() {
-        return Ok(());
-    }
-    let tmp = video.with_file_name(format!(
-        "{}.mux.mp4",
-        video.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
-    ));
-    let mut cmd = std::process::Command::new(ffmpeg);
-    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
-    cmd.arg("-i").arg(video);
-    for t in tracks {
-        cmd.arg("-i").arg(t);
-    }
-    cmd.arg("-map").arg("0:v:0");
-    if tracks.len() == 1 {
-        cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
-    } else {
-        let graph = format!(
-            "[1:a][2:a]amix=inputs={}:duration=longest:normalize=0[mix];[mix]apad[a]",
-            tracks.len()
-        );
-        cmd.arg("-filter_complex").arg(graph);
-        cmd.arg("-map").arg("[a]");
-    }
-    cmd.arg("-c:v").arg("copy");
-    cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k").arg("-ar").arg("48000");
-    cmd.arg("-shortest").arg("-movflags").arg("+faststart");
-    cmd.arg(&tmp);
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("调用 ffmpeg 封装音频失败: {e}"))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    if std::fs::remove_file(video).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err("替换成片失败：无法删除原文件".into());
-    }
-    std::fs::rename(&tmp, video).map_err(|e| format!("替换成片失败: {e}"))
-}
 
 fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> String {
     let s = &cfg.settings;
@@ -287,6 +236,7 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
             "  \"lookaheadMs\": {:.1},\n",
             "  \"deadZone\": {:.4},\n",
             "  \"cursorSmoothMs\": {:.1},\n",
+            "  \"clickRing\": {},\n",
             // duration/frames are recorded here so loaders never have to probe
             // the file with ffmpeg to find out how long the clip is
             "  \"duration\": {:.6},\n",
@@ -311,6 +261,7 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
         s.lookahead_ms,
         s.dead_zone,
         s.cursor_smooth_ms,
+        if s.click_ring { 1 } else { 0 },
         duration,
         dropped,
         frames
@@ -512,8 +463,13 @@ fn run(
 
     // Spawned lazily, together with the clock, so the trace and the video share
     // their origin no matter how long the encoders take to warm up.
+    // The camera thread owns `track.csv`; joining it is what guarantees the
+    // trace is on disk before anything reads the take back.
+    let cam_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut spawn_camera: Option<Box<dyn FnOnce(Instant) + Send>> = {
         let shared = shared.clone();
+        let cam_slot = cam_handle.clone();
         let s2 = s.clone();
         let stop2 = stop.clone();
         let cursor = cfg.cursor.clone();
@@ -565,8 +521,13 @@ fn run(
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                crate::mc_error!("rec", "启动相机线程失败: {e}");
+            match spawned {
+                Ok(h) => {
+                    if let Ok(mut slot) = cam_slot.lock() {
+                        *slot = Some(h);
+                    }
+                }
+                Err(e) => crate::mc_error!("rec", "启动相机线程失败: {e}"),
             }
         }))
     };
@@ -595,6 +556,9 @@ fn run(
     let mut written: i64 = 0;
     let mut written_pub: i64 = 0;
     let mut write_err: Option<String> = None;
+    // Set when the capture side dies. Carried into `failure` so the take reports
+    // itself as broken instead of ending quietly after four seconds.
+    let mut capture_dead: Option<String> = None;
     // A full disk is the most common way a long recording dies, and ffmpeg only
     // says so after the file is already damaged.
     if let Some(mb) = free_space_mb(out_dir) {
@@ -609,7 +573,16 @@ fn run(
         let frame_t0 = Instant::now();
         if !cap.grab(&mut frame_buf) {
             dropped += 1;
+            if let Some(code) = cap.format_problem() {
+                capture_dead = Some(format!(
+                    "显示器色彩格式不受支持（HDR 或 10bit，format=0x{code:X}），请在 Windows 设置中关闭 HDR 后重试"
+                ));
+                break;
+            }
             if dropped > 120 {
+                capture_dead = Some(
+                    "连续 4 秒没有取到新画面（显示器切换、分辨率变化，或采集被其他程序占用）".into(),
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -818,11 +791,18 @@ fn run(
     crate::hud::set_rect(None, "");
     let elapsed = t0_shared.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed); // camera thread
-    std::thread::sleep(Duration::from_millis(20));
+    // Waiting for it actually to finish, rather than hoping 20 ms was enough:
+    // the track buffer is flushed when the thread exits, and a partial
+    // track.csv is the one thing that cannot be reconstructed later.
+    if let Ok(mut slot) = cam_handle.lock() {
+        if let Some(h) = slot.take() {
+            let _ = h.join();
+        }
+    }
     drop(frames_csv);
 
-    let master_code = master.map(|m| m.finish()).unwrap_or(0);
-    let code = camera.finish();
+    let (master_code, master_err) = master.map(|m| m.finish()).unwrap_or((0, String::new()));
+    let (code, camera_err) = camera.finish();
 
     // Audio is folded in after the encoders have closed their files, so a
     // failed mux leaves a perfectly good silent video rather than a broken one.
@@ -844,7 +824,7 @@ fn run(
         let ff = ffmpeg.clone();
         for name in ["master.mp4", "camera.mp4"] {
             let video = out_dir.join(name);
-            match mux_audio(&ff, &video, &usable) {
+            match crate::ffmpeg::mux_audio(&ff, &video, &usable, 0.0, None) {
                 Ok(()) => crate::mc_info!("audio", "{name} 已加入 {} 条音轨", usable.len()),
                 Err(e) => {
                     crate::mc_warn!("audio", "{name} 封装音频失败: {e}");
@@ -853,12 +833,12 @@ fn run(
         }
     }
 
-    let mut failure = write_err;
+    let mut failure = write_err.or(capture_dead);
     if failure.is_none() && master_code != 0 {
-        failure = Some(format!("原片编码器异常退出 ({master_code})"));
+        failure = Some(format!("原片编码器异常退出 ({master_code}) {master_err}"));
     }
     if failure.is_none() && code != 0 {
-        failure = Some(format!("跟拍编码器异常退出 ({code})"));
+        failure = Some(format!("跟拍编码器异常退出 ({code}) {camera_err}"));
     }
 
     // Written either way: a folder without meta.json is invisible in the

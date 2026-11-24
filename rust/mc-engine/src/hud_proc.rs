@@ -278,13 +278,20 @@ unsafe fn repaint(hwnd: HWND) {
 
     let need_w = fw + pad * 2;
     let need_h = fh + pad * 2;
-    let (ww, wh) = (need_w.max(16), need_h.max(16));
+    // Grow in 64 px steps and never shrink, the same rule the in-process
+    // overlay uses. The crop rect moves by a few pixels every frame, and
+    // rebuilding a multi-megabyte DIB that often is pure churn: the surplus is
+    // transparent, so a larger surface is invisible.
+    let (ww, wh) = (
+        (((need_w.max(16) + 63) / 64) * 64).clamp(64, 8192),
+        (((need_h.max(16) + 63) / 64) * 64).clamp(64, 8192),
+    );
 
     PAINTER.with(|cell| {
         let mut p = cell.borrow_mut();
-        let stale = p.surface.as_ref().map(|s| (s.w, s.h) != (ww, wh)).unwrap_or(true);
-        if stale {
-            p.surface = Surface::new(ww, wh);
+        let (cw, ch) = p.surface.as_ref().map(|s| (s.w, s.h)).unwrap_or((0, 0));
+        if cw < ww || ch < wh {
+            p.surface = Surface::new(cw.max(ww), ch.max(wh));
         }
         let Some(s) = p.surface.as_mut() else {
             return;

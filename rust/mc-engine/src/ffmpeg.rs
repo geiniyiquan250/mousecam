@@ -153,6 +153,10 @@ fn no_window(cmd: &mut Command) -> &mut Command {
 pub struct FrameWriter {
     child: Child,
     stdin: Option<ChildStdin>,
+    /// ffmpeg's own complaints, kept so a failure can say why. Without this the
+    /// only symptom is a pipe that closes and a file that is too small.
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    done: bool,
     pub w: i32,
     pub h: i32,
     pub path: String,
@@ -182,14 +186,37 @@ impl FrameWriter {
         let mut child = no_window(&mut cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
 
         let stdin = child.stdin.take().ok_or("ffmpeg stdin 不可用")?;
+        // Drained on its own thread: a full stderr pipe would block ffmpeg, and
+        // that looks exactly like a slow encode.
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = stderr.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut s) = sink.lock() {
+                        if s.len() > 60_000 {
+                            s.clear();
+                        }
+                        s.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                }
+            });
+        }
         Ok(Self {
             child,
             stdin: Some(stdin),
+            stderr,
+            done: false,
             w,
             h,
             path: out.display().to_string(),
@@ -207,12 +234,51 @@ impl FrameWriter {
     }
 
     /// Closes stdin and waits for ffmpeg to finish.
-    pub fn finish(mut self) -> i32 {
+    /// Stops the encoder right now. Used when a render is abandoned, where
+    /// closing stdin politely would leave ffmpeg holding the output file open
+    /// for long enough that deleting it fails and a half-written file survives.
+    pub fn abort(mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.done = true;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    /// Last few hundred characters ffmpeg printed, for error messages.
+    fn tail(&self) -> String {
+        let s = match self.stderr.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return String::new(),
+        };
+        let t = s.trim();
+        // chars, not bytes: slicing a UTF-8 string at a byte offset panics
+        let tail: String = t.chars().rev().take(700).collect::<Vec<char>>().into_iter().rev().collect();
+        tail
+    }
+
+    pub fn finish(mut self) -> (i32, String) {
         drop(self.stdin.take());
-        match self.child.wait() {
+        let code = match self.child.wait() {
             Ok(st) => st.code().unwrap_or(-1),
             Err(_) => -1,
+        };
+        self.done = true;
+        (code, self.tail())
+    }
+}
+
+impl Drop for FrameWriter {
+    /// A writer dropped on an early return must not leave ffmpeg running with
+    /// the output file open - that is how a half written take survives.
+    fn drop(&mut self) {
+        if self.done {
+            return;
         }
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.done = true;
     }
 }
 
@@ -285,6 +351,82 @@ impl Drop for FrameReader {
 }
 
 /// Reads `Duration: HH:MM:SS.ss` out of ffmpeg's banner.
+/// Muxes WAV tracks into an already-encoded video, replacing it in place.
+///
+/// `at` is where the audio should start, so a trimmed render keeps the sound that
+/// belongs to the frames it kept rather than the sound of the whole take. `dur`
+/// caps the result: the picture is the authority on length, and the audio is
+/// padded to reach it instead of cutting the video short.
+pub fn mux_audio(
+    ffmpeg: &Path,
+    video: &Path,
+    tracks: &[std::path::PathBuf],
+    at: f64,
+    dur: Option<f64>,
+) -> Result<(), String> {
+    if tracks.is_empty() || !video.exists() {
+        return Ok(());
+    }
+    let ext = video
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".into());
+    let tmp = video.with_file_name(format!(
+        "{}.mux.{ext}",
+        video.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    ));
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.arg("-i").arg(video);
+    for t in tracks {
+        if at > 0.0005 {
+            cmd.arg("-ss").arg(format!("{at:.3}"));
+        }
+        cmd.arg("-i").arg(t);
+    }
+    cmd.arg("-map").arg("0:v:0");
+    if tracks.len() == 1 {
+        cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
+    } else {
+        let graph = format!(
+            "[1:a][2:a]amix=inputs={}:duration=longest:normalize=0[mix];[mix]apad[a]",
+            tracks.len()
+        );
+        cmd.arg("-filter_complex").arg(graph);
+        cmd.arg("-map").arg("[a]");
+    }
+    cmd.arg("-c:v").arg("copy");
+    cmd.arg("-c:a").arg("aac").arg("-b:a").arg("160k").arg("-ar").arg("48000");
+    if let Some(d) = dur {
+        if d > 0.0 {
+            cmd.arg("-t").arg(format!("{d:.3}"));
+        }
+    }
+    cmd.arg("-shortest");
+    if ext == "mp4" || ext == "mov" {
+        cmd.arg("-movflags").arg("+faststart");
+    }
+    cmd.arg(&tmp);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("调用 ffmpeg 封装音频失败: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    if std::fs::remove_file(video).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("替换成片失败：无法删除原文件".into());
+    }
+    std::fs::rename(&tmp, video).map_err(|e| format!("替换成片失败: {e}"))
+}
+
 pub fn media_duration(ffmpeg: &Path, file: &Path) -> f64 {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-i"]).arg(file);

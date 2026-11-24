@@ -382,14 +382,6 @@ pub fn render_clip(
     })
 }
 
-/// Whether the export has to paint a pointer of its own.
-///
-/// The recorder copy is the authority: a take that already has the pointer in
-/// the master must not get a second one, or the export shows two arrows.
-fn should_composite_pointer(clip: &ClipInfo) -> bool {
-    !clip.pointer_in_master
-}
-
 fn log_line(msg: &str) {
     println!("{msg}");
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
@@ -407,6 +399,14 @@ fn log_line(msg: &str) {
 /// Exposed for the CLI: duration probe of the master.
 pub fn clip_duration(ffmpeg: &Path, clip: &ClipInfo) -> f64 {
     _dur(ffmpeg, &clip.master)
+}
+
+/// Whether the export has to paint a pointer of its own.
+///
+/// The recorder copy is the authority: a take that already has the pointer in
+/// the master must not get a second one, or the export shows two arrows.
+fn should_composite_pointer(clip: &ClipInfo) -> bool {
+    !clip.pointer_in_master
 }
 
 #[cfg(test)]

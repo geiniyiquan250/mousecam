@@ -16,6 +16,7 @@ pub enum VideoFormat {
     MkvH265,
     WebmVp9,
     Gif,
+    WebPAnim,
     MovProres,
 }
 
@@ -27,6 +28,7 @@ impl VideoFormat {
             VideoFormat::MkvH265 => "MKV · H.265",
             VideoFormat::WebmVp9 => "WebM · VP9",
             VideoFormat::Gif => "GIF",
+            VideoFormat::WebPAnim => "WebP · 动图",
             VideoFormat::MovProres => "MOV · ProRes",
         }
     }
@@ -39,6 +41,7 @@ impl VideoFormat {
             VideoFormat::MkvH265 => "mkv_h265",
             VideoFormat::WebmVp9 => "webm_vp9",
             VideoFormat::Gif => "gif",
+            VideoFormat::WebPAnim => "webp",
             VideoFormat::MovProres => "mov_prores",
         }
     }
@@ -49,6 +52,7 @@ impl VideoFormat {
             "mkv_h265" => VideoFormat::MkvH265,
             "webm_vp9" => VideoFormat::WebmVp9,
             "gif" => VideoFormat::Gif,
+            "webp" | "webp_anim" => VideoFormat::WebPAnim,
             "mov_prores" => VideoFormat::MovProres,
             _ => VideoFormat::Mp4H264,
         }
@@ -59,6 +63,7 @@ impl VideoFormat {
             VideoFormat::MkvH265 => "mkv",
             VideoFormat::WebmVp9 => "webm",
             VideoFormat::Gif => "gif",
+            VideoFormat::WebPAnim => "webp",
             VideoFormat::MovProres => "mov",
             _ => "mp4",
         }
@@ -110,6 +115,22 @@ impl VideoFormat {
                 .iter()
                 .map(|s| s.to_string()),
             ),
+            VideoFormat::WebPAnim => {
+                // `crf` counts up as quality drops (8 best .. 40 worst), WebP's
+                // `-quality` counts the other way, so map one onto the other.
+                // `preset text` keeps small glyphs crisp, which is what a
+                // screen recording is mostly made of.
+                let q = (100.0 - (crf as f32 - 8.0) * 2.2).clamp(30.0, 95.0);
+                a.extend(
+                    [
+                        "-c:v", "libwebp_anim", "-preset", "text",
+                        "-quality", &format!("{q:.0}"), "-lossless", "0",
+                        "-loop", "0",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string()),
+                )
+            }
             VideoFormat::MovProres => a.extend(
                 ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]
                     .iter()
@@ -536,4 +557,49 @@ pub fn media_duration(ffmpeg: &Path, file: &Path) -> f64 {
     let m: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
     let s: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
     h * 3600.0 + m * 60.0 + s
+}
+
+#[cfg(test)]
+mod webp_tests {
+    use super::VideoFormat;
+
+    /// The UI writes the id and reads it back through the same table.
+    #[test]
+    fn webp_round_trips_through_its_id() {
+        assert_eq!(VideoFormat::WebPAnim.id(), "webp");
+        assert_eq!(VideoFormat::parse("webp"), VideoFormat::WebPAnim);
+        assert_eq!(VideoFormat::parse("webp_anim"), VideoFormat::WebPAnim);
+        assert_eq!(VideoFormat::WebPAnim.extension(), "webp");
+    }
+
+    /// The quality slider runs 8 (best) to 40 (worst) while libwebp's
+    /// `-quality` runs the other way; a mapping that ignored that would export
+    /// the worst file at the highest slider setting.
+    #[test]
+    fn better_slider_means_higher_webp_quality() {
+        let q = |crf: i32| -> f32 {
+            let args = VideoFormat::WebPAnim.codec_args(crf);
+            let i = args.iter().position(|a| a == "-quality").unwrap();
+            args[i + 1].parse().unwrap()
+        };
+        let best = q(8);
+        let mid = q(18);
+        let worst = q(40);
+        assert!(best > mid && mid > worst, "{best} {mid} {worst}");
+        assert!((30.0..=95.0).contains(&worst), "clamped into libwebp's range");
+        assert!((30.0..=95.0).contains(&best));
+    }
+
+    /// A screen recording is mostly glyphs, so the encoder must be told so.
+    #[test]
+    fn webp_asks_for_the_text_preset_and_loops_forever() {
+        let args = VideoFormat::WebPAnim.codec_args(18);
+        assert!(args.iter().any(|a| a == "libwebp_anim"));
+        let i = args.iter().position(|a| a == "-preset").unwrap();
+        assert_eq!(args[i + 1], "text");
+        // lossy by default: lossless quadruples the file for a screencast
+        let l = args.iter().position(|a| a == "-lossless").unwrap();
+        assert_eq!(args[l + 1], "0");
+        assert!(args.iter().any(|a| a == "-loop"));
+    }
 }

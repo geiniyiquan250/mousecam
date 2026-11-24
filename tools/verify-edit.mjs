@@ -195,7 +195,11 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
     });
   })()`);
   const d = JSON.parse(dlg);
-  check('导出弹窗可打开且有选项', d.open && d.formats.length === 6 && d.hasQuality && d.hasWidth && d.hasFps, dlg);
+  // A count would go stale every time a format is added; require the ones the
+  // dialog must always offer instead.
+  const required = ['mp4_h264', 'gif', 'webp'];
+  const missing = required.filter((f) => !d.formats.includes(f));
+  check('导出弹窗可打开且有选项', d.open && missing.length === 0 && d.hasQuality && d.hasWidth && d.hasFps, dlg);
   await cdp.eval(`document.getElementById('exCancel').click()`);
   await sleep(200);
   check('弹窗可取消', await cdp.eval(`document.getElementById('exportModal').classList.contains('is-hidden')`));

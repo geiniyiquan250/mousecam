@@ -753,7 +753,8 @@ pub fn export(
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if !audio.is_empty() && ext != "gif" {
+    // Animated GIF and WebP have no audio stream to mux into.
+    if !audio.is_empty() && ext != "gif" && ext != "webp" {
         // The sound follows the same timeline as the picture: every kept range
         // is cut from its own start, and a speed region stretches that piece the
         // way the frames were stretched. Without an edit this stays None and the

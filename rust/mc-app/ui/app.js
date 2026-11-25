@@ -102,6 +102,10 @@ const state = {
   trims: [],            // [{a, b}, ...] kept ranges; empty = whole clip
   speeds: [],           // [{a, b, speed}, ...] speed regions, source seconds
   speedSel: -1,         // index of the region whose slider is showing
+  // Only one region may have its edges unlocked at a time. Dragging a boundary
+  // used to hit whichever happened to be nearest, which made adjacent regions
+  // impossible to adjust without disturbing the other.
+  speedEdit: -1,
   kfs: [],              // [{t, x, y}] manual follow points
   kfMode: false,
   trimMode: false,
@@ -863,6 +867,7 @@ function applyEditState(json) {
   state.trims = o.trims || [];
   state.speeds = o.speeds || [];
   state.speedSel = -1;
+  state.speedEdit = -1;
   syncSpeedControls();
   state.kfs = o.kfs || [];
   Object.assign(state.edit, o.edit || {});
@@ -908,6 +913,7 @@ function applyLoadedEdit(st) {
   state.trims = (st.trims || []).map(([a, b]) => ({ a, b }));
   state.speeds = (st.speeds || []).map(([a, b, speed]) => ({ a, b, speed }));
   state.speedSel = -1;
+  state.speedEdit = -1;
   syncSpeedControls();
   state.kfs = (st.kfs || []).map(([t, x, y]) => ({ t, x, y }));
   buildParams('paramsGrid');
@@ -1025,6 +1031,7 @@ $('btnSpeedClear').onclick = () => {
   pushUndo();
   state.speeds = [];
   state.speedSel = -1;
+  state.speedEdit = -1;
   syncSpeedControls();
   scheduleSaveEdit();
   drawTimeline();
@@ -1161,6 +1168,7 @@ async function selectClip(dir) {
   state.trims = [];
   state.speeds = [];
   state.speedSel = -1;
+  state.speedEdit = -1;
   syncSpeedControls();
   state.kfs = [];
   try {
@@ -1868,14 +1876,27 @@ const SPEED_DEL_INSET = 11;
 function speedDeleteSpot(g, i, laneY) {
   const e = speedEdges(g)[i];
   if (!e) return null;
-  if (e.b - e.a < SPEED_DEL_INSET + SPEED_DEL_R + 3) return null;
+  // Needs room for both badges, since the lock sits at the other end.
+  if (e.b - e.a < SPEED_DEL_INSET * 2 + SPEED_DEL_R + 3) return null;
   return { x: e.a + SPEED_DEL_INSET, y: laneY + SPEED_DEL_INSET };
+}
+
+// The edit lock, at the region's top-right corner. It has to exist even on a
+// narrow box - that is where adjusting a fiddly region begins - so it wins the
+// space and the minus badge is the one that steps aside.
+function speedEditSpot(g, i, laneY) {
+  const e = speedEdges(g)[i];
+  if (!e) return null;
+  if (e.b - e.a < SPEED_DEL_R * 2 + 6) return null;
+  return { x: e.b - SPEED_DEL_INSET, y: laneY + SPEED_DEL_INSET };
 }
 
 function deleteSpeedRegion(i) {
   if (i < 0 || i >= state.speeds.length) return;
   pushUndo();
   state.speeds.splice(i, 1);
+  if (state.speedEdit === i) state.speedEdit = -1;
+  else if (state.speedEdit > i) state.speedEdit--;
   if (state.speedSel === i) state.speedSel = -1;
   else if (state.speedSel > i) state.speedSel--;
   normalizeSpeeds();
@@ -1901,6 +1922,20 @@ function normalizeSpeeds() {
     }))
     .filter((v) => v.b - v.a >= minGap)
     .sort((x, y) => x.a - y.a);
+  // Sorting can move a region to another index, and filtering can drop one, so
+  // a lock held by index would end up on a different region. Release it rather
+  // than silently unlock the wrong one.
+  if (list.length !== state.speeds.length) {
+    state.speedEdit = -1;
+    state.speedSel = -1;
+  } else if (state.speedEdit >= 0) {
+    const locked = state.speeds[state.speedEdit];
+    const moved = list.findIndex(
+      (r) => r.a === locked.a && r.b === locked.b && r.speed === locked.speed
+    );
+    state.speedEdit = moved;
+    state.speedSel = moved;
+  }
   state.speeds = list;
   if (state.speedSel >= list.length) state.speedSel = list.length - 1;
 }
@@ -2149,6 +2184,10 @@ function drawTimeline() {
   }
 
   // ---- speed regions (drawn above the trim tint, below the playhead)
+  //
+  // Two passes. The first draws the boxes and labels, the second the badges on
+  // top: a region nested inside another used to have its badges painted over by
+  // the newer box, leaving its lock unreachable.
   const se = speedEdges(g);
   if (se.length) {
     ctx.save();
@@ -2158,6 +2197,7 @@ function drawTimeline() {
       const heat = Math.min(1, Math.abs(Math.log2(speed)) / 2);
       const w = Math.max(1, se[i].b - se[i].a);
       const sel = i === state.speedSel;
+      const unlocked = state.speedEdit === i;
       const hue = fast ? '255,176,79' : '120,180,255';
       // A region drawn on top of an earlier one only contributes its outline:
       // filling again would hide the one underneath, and with it its label.
@@ -2175,9 +2215,26 @@ function drawTimeline() {
         ctx.lineWidth = 6;
         ctx.strokeRect(se[i].a - 1, laneY + .5, w + 2, laneH - 1);
       }
+      // A locked region's outline is dashed: its edges will not answer a drag,
+      // and only the unlocked one gets drawable end caps.
+      ctx.setLineDash(unlocked === false && i !== state.speedEdit ? [4, 3] : []);
       ctx.strokeStyle = `rgba(${hue},${sel ? 1 : 0.7})`;
       ctx.lineWidth = sel ? 2 : 1.4;
       ctx.strokeRect(se[i].a + .5, laneY + .5, w - 1, laneH - 1);
+      ctx.setLineDash([]);
+
+      if (state.speedEdit === i) {
+        // end caps, only while this region is the unlocked one
+        for (const x of [se[i].a, se[i].b]) {
+          ctx.beginPath();
+          ctx.arc(x, laneY + laneH / 2, 4.5, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${hue},1)`;
+          ctx.fill();
+          ctx.strokeStyle = '#0a0d12';
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+        }
+      }
 
       // Show the factor that will actually play here. Where regions stack that
       // is their product, so a 2× drawn over a 2× stretch reads 4×, not 2×.
@@ -2193,12 +2250,50 @@ function drawTimeline() {
         ctx.fillText(label, (se[i].a + se[i].b + labelShift) / 2, laneY + laneH - 10);
         ctx.textAlign = 'start';
       }
+    }
 
-      // per-region remove button: 清除变速 still drops them all, this drops one
+    // second pass: every badge, above every box
+    for (let i = 0; i < se.length; i++) {
+      const sel = i === state.speedSel;
+      const unlocked = state.speedEdit === i;
+      const hue = state.speeds[i].speed >= 1 ? '255,176,79' : '120,180,255';
+
+      const tog = speedEditSpot(g, i, laneY);
+      if (tog) {
+        ctx.beginPath();
+        ctx.arc(tog.x, tog.y, SPEED_DEL_R, 0, Math.PI * 2);
+        ctx.fillStyle = unlocked ? 'rgba(46,230,168,.95)' : 'rgba(12,16,22,.82)';
+        ctx.fill();
+        ctx.strokeStyle = unlocked ? 'rgba(12,16,22,.55)' : 'rgba(150,170,200,.85)';
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        const ink = unlocked ? '#0a0d12' : 'rgba(190,205,230,1)';
+        ctx.strokeStyle = ink;
+        ctx.fillStyle = ink;
+        ctx.lineWidth = 1.5;
+        if (unlocked) {
+          // open padlock: the shackle is lifted off the body
+          ctx.beginPath();
+          ctx.arc(tog.x - 1.2, tog.y - 2.4, 1.8, Math.PI, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(tog.x - 3.0, tog.y - 2.4);
+          ctx.lineTo(tog.x - 3.0, tog.y + 0.4);
+          ctx.stroke();
+        } else {
+          // closed padlock
+          ctx.beginPath();
+          ctx.arc(tog.x, tog.y - 1.6, 1.7, Math.PI, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.fillRect(tog.x - 3.0, tog.y + 0.4, 6, 3.4);
+      }
+
+      const del = speedDeleteSpot(g, i, laneY);
       if (del) {
         ctx.beginPath();
         ctx.arc(del.x, del.y, SPEED_DEL_R, 0, Math.PI * 2);
-        ctx.fillStyle = sel ? `rgba(${hue},.95)` : 'rgba(12,16,22,.72)';
+        ctx.fillStyle = sel ? `rgba(${hue},.95)` : 'rgba(12,16,22,.82)';
         ctx.fill();
         ctx.strokeStyle = sel ? 'rgba(12,16,22,.55)' : `rgba(${hue},.85)`;
         ctx.lineWidth = 1.2;
@@ -2407,15 +2502,46 @@ tlCanvas.addEventListener('mousedown', (ev) => {
       }
     }
   }
+  // the edit toggle is small and always live, like the minus badge
+  {
+    const y = ev.clientY - r.top;
+    const laneY = 26;
+    for (let i = 0; i < state.speeds.length; i++) {
+      const tog = speedEditSpot(g, i, laneY);
+      if (!tog) continue;
+      if (Math.hypot(x - tog.x, y - tog.y) <= SPEED_DEL_R + 2) {
+        // one at a time: opening another closes the previous
+        state.speedEdit = state.speedEdit === i ? -1 : i;
+        state.speedSel = state.speedEdit;
+        syncSpeedControls();
+        drawTimeline();
+        if (state.speedEdit >= 0) {
+          toast('已解锁该区间的边界，拖动两端调整；再次点击锁定', 2400);
+        }
+        return;
+      }
+    }
+  }
   if (state.speedMode) {
-    // grab the region under the pointer to select it, otherwise start a new one
+    // Only the unlocked region answers a boundary grab. Without this the
+    // pointer hit whichever edge was nearest, so touching A moved B.
     const se = speedEdges(g);
+    if (state.speedEdit >= 0 && se[state.speedEdit]) {
+      const e = se[state.speedEdit];
+      const nearA = Math.abs(x - e.a) <= TRIM_HIT * 1.6;
+      const nearB = Math.abs(x - e.b) <= TRIM_HIT * 1.6;
+      if (nearA || nearB) {
+        pushUndo();
+        tlDrag = { kind: 'speedEdge', i: state.speedEdit, which: nearA ? 'a' : 'b' };
+        tlDragAnchor = xToTime(g, x);
+        drawTimeline();
+        return;
+      }
+    }
+    // selecting a region no longer unlocks it; that is the edit toggle's job
     for (let i = 0; i < se.length; i++) {
       if (x >= se[i].a - 4 && x <= se[i].b + 4) {
         state.speedSel = i;
-        pushUndo();
-        tlDrag = { kind: 'speedEdge', i, which: x - se[i].a < se[i].b - x ? 'a' : 'b' };
-        tlDragAnchor = xToTime(g, x);
         syncSpeedControls();
         drawTimeline();
         return;
@@ -2482,6 +2608,7 @@ tlCanvas.addEventListener('dblclick', (ev) => {
     pushUndo();
     state.speeds.splice(vi, 1);
     state.speedSel = -1;
+  state.speedEdit = -1;
     normalizeSpeeds();
     syncSpeedControls();
     drawTimeline();
@@ -2594,10 +2721,14 @@ window.addEventListener('mouseup', () => {
     markTrimDirty();
   } else if (tlDrag && tlDrag.kind === 'speedEdge') {
     normalizeSpeeds();
+    // The edit session ends with the drag: the user gets one deliberate
+    // adjustment, then the region locks again so a stray drag cannot move it.
+    state.speedEdit = -1;
     syncSpeedControls();
     drawTimeline();
     drawLeft();
     markTrimDirty();
+    toast('已锁定该区间；再次点锁钮可继续调整', 1800);
   }
   if (state.dragHint) {
     state.dragHint = null;
@@ -2880,6 +3011,14 @@ document.addEventListener('keydown', (e) => {
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
   const rec = document.getElementById('stageRecord');
   if (rec && !rec.classList.contains('is-hidden')) return;
+
+  // Escape closes an open region edit, the same as clicking the lock again.
+  if (e.key === 'Escape' && state.speedEdit >= 0) {
+    state.speedEdit = -1;
+    syncSpeedControls();
+    drawTimeline();
+    return;
+  }
 
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 'z') {

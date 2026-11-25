@@ -36,8 +36,9 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 for (const [n, next] of [
-  ['speedEdges', 'normalizeSpeeds'],
-  ['speedDeleteSpot', 'deleteSpeedRegion'],
+  ['speedEdges', 'speedDeleteSpot'],
+  ['speedDeleteSpot', 'speedEditSpot'],
+  ['speedEditSpot', 'deleteSpeedRegion'],
   ['deleteSpeedRegion', 'normalizeSpeeds'],
   ['normalizeSpeeds', 'speedTotal'],
   ['speedRate', 'keptSegs'],
@@ -89,10 +90,18 @@ const g = {};
 }
 state.speeds = [{ a: 0, b: 0.1, speed: 2 }];      // 10 px wide: too narrow
 assert.equal(sandbox.speedDeleteSpot(g, 0, 26), null);
-state.speeds = [{ a: 0, b: 0.19, speed: 2 }];     // 19 px: still too narrow
+state.speeds = [{ a: 0, b: 0.30, speed: 2 }];     // 30 px: still short of both badges
 assert.equal(sandbox.speedDeleteSpot(g, 0, 26), null);
-state.speeds = [{ a: 0, b: 0.2, speed: 2 }];      // 20 px: just fits
+state.speeds = [{ a: 0, b: 0.32, speed: 2 }];     // 32 px: both fit
 assert.notEqual(sandbox.speedDeleteSpot(g, 0, 26), null);
+
+// The edit lock has to exist on boxes too narrow for the minus: adjusting a
+// fiddly region is exactly what the lock is for.
+state.speeds = [{ a: 0, b: 0.20, speed: 2 }];     // 20 px: too narrow for both
+assert.equal(sandbox.speedDeleteSpot(g, 0, 26), null, 'minus steps aside');
+assert.notEqual(sandbox.speedEditSpot(g, 0, 26), null, 'lock still there');
+state.speeds = [{ a: 0, b: 0.1, speed: 2 }];      // 10 px: nothing fits
+assert.equal(sandbox.speedEditSpot(g, 0, 26), null);
 
 // removing one region leaves the others, and keeps the selection sane
 state.speeds = [{ a: 0, b: 2, speed: 2 }, { a: 3, b: 5, speed: 0.5 }, { a: 6, b: 8, speed: 4 }];
@@ -114,4 +123,4 @@ assert.equal(state.speedSel, -1);
 sandbox.deleteSpeedRegion(5);
 assert.equal(state.speeds.length, 0);
 
-console.log('PASS: speed regions — overlap, clamp, serialization and per-region delete');
+console.log('PASS: speed regions — overlap, clamp, serialization, per-region delete and edit lock');

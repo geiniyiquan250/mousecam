@@ -2821,6 +2821,7 @@ function playVideos(on) {
     playOutAtStart = srcToOut(state.frame / fps);
     playOutT = playOutAtStart;
     playOutStart = performance.now();
+    masterSeekTick = 0;
     const piece = pieceAt(playOutT);
     const at = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
     if (playingWithProxy()) {
@@ -2851,6 +2852,8 @@ function playVideos(on) {
   }
 }
 
+let masterSeekTick = 0;
+
 function tickVideo() {
   if (!state.playing) return;
   const fps = state.bake ? state.bake.fps : 30;
@@ -2871,13 +2874,23 @@ function tickVideo() {
   state.frame = Math.max(0, Math.min(last, Math.round(srcT * fps)));
 
   if (!playingWithProxy() && state.useVideo && v.readyState >= 2) {
-    // keep the picture on the playhead and on the right rate, so a region
-    // boundary mid-play does not stutter or play at the old speed
+    // No proxy: the master IS the picture, so it has to play. Two things make
+    // that hard at speed:
+    //   - playbackRate tops out at 4, while stacked regions can ask for 8, so
+    //     the clock and the element drift apart and every frame wants a seek;
+    //   - each seek decodes the full-size take.
+    // Cap the element's rate, and only correct the drift every few frames - a
+    // seek per frame starved the decoder and the picture stopped updating
+    // altogether.
     const want = piece ? piece.speed : 1;
-    if (Math.abs(v.playbackRate - want) > 1e-3) {
-      try { v.playbackRate = Math.min(4, Math.max(0.25, want)); } catch {}
+    const rate = Math.min(4, Math.max(0.25, want));
+    if (Math.abs(v.playbackRate - rate) > 1e-3) {
+      try { v.playbackRate = rate; } catch {}
     }
-    if (Math.abs(v.currentTime - srcT) > 0.20) {
+    // Beyond 4x the element cannot keep up on its own, so a periodic nudge is
+    // the only way to stay near the playhead.
+    const drift = Math.abs(v.currentTime - srcT);
+    if (++masterSeekTick % 6 === 0 && drift > (want > 4 ? 1.0 : 0.35)) {
       try { v.currentTime = srcT; } catch {}
     }
   }

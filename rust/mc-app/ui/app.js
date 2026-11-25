@@ -2252,8 +2252,9 @@ function drawTimeline() {
       }
     }
 
-    // second pass: every badge, above every box
-    for (let i = 0; i < se.length; i++) {
+    // second pass: the badges, above every box. They only exist while 变速 is
+    // armed - outside it a stray click must not be able to erase a region.
+    for (let i = 0; i < se.length && state.speedMode; i++) {
       const sel = i === state.speedSel;
       const unlocked = state.speedEdit === i;
       const hue = state.speeds[i].speed >= 1 ? '255,176,79' : '120,180,255';
@@ -2471,9 +2472,9 @@ tlCanvas.addEventListener('mousedown', (ev) => {
     return;
   }
 
-  // The minus badge wins over everything: it is small and sits inside the box,
-  // and it stays live outside 变速 mode.
-  {
+  // The minus badge only exists while 变速 is armed: outside it the regions are
+  // a read-only record of the edit, and a stray click must not erase one.
+  if (state.speedMode) {
     const y = ev.clientY - r.top;
     const laneY = 26;
     for (let i = 0; i < state.speeds.length; i++) {
@@ -2502,8 +2503,9 @@ tlCanvas.addEventListener('mousedown', (ev) => {
       }
     }
   }
-  // the edit toggle is small and always live, like the minus badge
-  {
+  // The edit toggle belongs to 变速 mode as well: unlocking outside it would
+  // leave a region whose edges cannot actually be dragged.
+  if (state.speedMode) {
     const y = ev.clientY - r.top;
     const laneY = 26;
     for (let i = 0; i < state.speeds.length; i++) {
@@ -2538,13 +2540,15 @@ tlCanvas.addEventListener('mousedown', (ev) => {
         return;
       }
     }
-    // selecting a region no longer unlocks it; that is the edit toggle's job
+    // Selecting an existing region is just a side effect of where the drag
+    // starts: the drag itself must still be free to lay a new region on top,
+    // which is how a span gets sped up twice. With a region unlocked its edges
+    // were handled above, so a click inside it falls through to here.
     for (let i = 0; i < se.length; i++) {
       if (x >= se[i].a - 4 && x <= se[i].b + 4) {
         state.speedSel = i;
         syncSpeedControls();
-        drawTimeline();
-        return;
+        break;
       }
     }
     pushUndo();
@@ -2601,21 +2605,8 @@ tlCanvas.addEventListener('wheel', (ev) => {
 tlCanvas.addEventListener('dblclick', (ev) => {
   const r = tlCanvas.getBoundingClientRect();
   const t = xToTime(tlGeom(), ev.clientX - r.left);
-  // in 变速 mode a double-click removes the speed region under the pointer
-  if (state.speedMode) {
-    const vi = state.speeds.findIndex((x) => t >= x.a && t <= x.b);
-    if (vi < 0) return;
-    pushUndo();
-    state.speeds.splice(vi, 1);
-    state.speedSel = -1;
-  state.speedEdit = -1;
-    normalizeSpeeds();
-    syncSpeedControls();
-    drawTimeline();
-    drawLeft();
-    markTrimDirty();
-    return;
-  }
+  // Speed regions are removed only by their own minus badge. A double-click
+  // there was too easy to trigger by accident while scrubbing.
   // Removing a kept range is an edit to the trim, so it too belongs to 裁切 mode.
   if (!state.trimMode) return;
   const i = state.trims.findIndex((x) => t >= x.a && t <= x.b);

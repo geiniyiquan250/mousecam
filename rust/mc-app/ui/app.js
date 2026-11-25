@@ -1891,6 +1891,8 @@ function normalizeSpeeds() {
   const dur = state.clip ? state.clip.duration : Infinity;
   const fps = state.bake ? state.bake.fps : 30;
   const minGap = 3 / fps;
+  // Overlaps are kept: regions stack instead of truncating, so a span can be
+  // sped up again without redrawing everything around it.
   const list = state.speeds
     .map((v) => ({
       a: Math.max(0, Math.min(v.a, v.b)),
@@ -1899,27 +1901,23 @@ function normalizeSpeeds() {
     }))
     .filter((v) => v.b - v.a >= minGap)
     .sort((x, y) => x.a - y.a);
-  const merged = [];
-  for (const v of list) {
-    const last = merged[merged.length - 1];
-    if (last && v.a < last.b - 1e-6) {
-      if (v.b > last.b) merged.push({ a: last.b, b: v.b, speed: v.speed });
-    } else {
-      merged.push(v);
-    }
-  }
-  state.speeds = merged;
-  if (state.speedSel >= merged.length) state.speedSel = merged.length - 1;
+  state.speeds = list;
+  if (state.speedSel >= list.length) state.speedSel = list.length - 1;
 }
 
 function speedTotal() {
   return state.speeds.reduce((sum, v) => sum + Math.max(0, v.b - v.a), 0);
 }
 
-// Plain speed at a source second, regions assumed non-overlapping.
+// Playback speed at a source second. Regions stack: every one covering `t`
+// multiplies in, clamped to what the frame map can express. Mirrors
+// edit::speed_at.
+const SPEED_EFFECTIVE_MIN = 0.1;
+const SPEED_EFFECTIVE_MAX = 8;
 function speedRate(t) {
-  for (const v of state.speeds) if (t >= v.a && t < v.b) return v.speed;
-  return 1;
+  let v = 1;
+  for (const r of state.speeds) if (t >= r.a && t < r.b) v *= r.speed;
+  return Math.max(SPEED_EFFECTIVE_MIN, Math.min(SPEED_EFFECTIVE_MAX, v));
 }
 
 // Kept ranges in source seconds, in play order.
@@ -2014,7 +2012,15 @@ function syncSpeedControls() {
   if (pick) {
     const sel = state.speeds[state.speedSel];
     pick.style.display = sel ? '' : 'none';
-    if (sel) pick.value = String(sel.speed);
+    if (sel) {
+      pick.value = String(sel.speed);
+      // The picker edits one region; the span may play faster because other
+      // regions lie on top of it, so say what the stack actually resolves to.
+      const eff = speedRate((sel.a + sel.b) / 2);
+      pick.title = Math.abs(eff - sel.speed) < 1e-6
+        ? '选中区间的播放倍速'
+        : `本段 ${sel.speed}×，叠加后实际 ${eff}×`;
+    }
   }
 }
 
@@ -2025,6 +2031,11 @@ function setSpeed(v) {
   pushUndo();
   state.speeds[i].speed = Math.max(SPEED_MIN, Math.min(SPEED_MAX, v));
   state.speedSel = i;
+  const r = state.speeds[i];
+  const eff = speedRate((r.a + r.b) / 2);
+  if (Math.abs(eff - r.speed) > 1e-6) {
+    toast(`本段 ${r.speed}×，叠加后实际 ${eff}×`, 2600);
+  }
   syncSpeedControls();
   drawTimeline();
   drawLeft();
@@ -2148,8 +2159,15 @@ function drawTimeline() {
       const w = Math.max(1, se[i].b - se[i].a);
       const sel = i === state.speedSel;
       const hue = fast ? '255,176,79' : '120,180,255';
-      ctx.fillStyle = `rgba(${hue},${0.10 + 0.16 * heat})`;
-      ctx.fillRect(se[i].a, laneY, w, laneH);
+      // A region drawn on top of an earlier one only contributes its outline:
+      // filling again would hide the one underneath, and with it its label.
+      const covered = state.speeds.slice(0, i).some(
+        (r) => r.a < state.speeds[i].b && r.b > state.speeds[i].a
+      );
+      if (!covered) {
+        ctx.fillStyle = `rgba(${hue},${0.10 + 0.16 * heat})`;
+        ctx.fillRect(se[i].a, laneY, w, laneH);
+      }
 
       if (sel) {
         // a soft halo so the selected region reads at a glance
@@ -2161,15 +2179,18 @@ function drawTimeline() {
       ctx.lineWidth = sel ? 2 : 1.4;
       ctx.strokeRect(se[i].a + .5, laneY + .5, w - 1, laneH - 1);
 
-      // the factor, when the span is wide enough to hold the label
+      // Show the factor that will actually play here. Where regions stack that
+      // is their product, so a 2× drawn over a 2× stretch reads 4×, not 2×.
       const del = speedDeleteSpot(g, i, laneY);
       const labelShift = del ? SPEED_DEL_R * 2 + 2 : 0;
       if (se[i].b - se[i].a > 34 + labelShift) {
+        const eff = speedRate((state.speeds[i].a + state.speeds[i].b) / 2);
+        const label = Math.abs(eff - speed) < 1e-6 ? `${speed}×` : `${speed}× → ${eff}×`;
         ctx.font = '10px "Segoe UI", system-ui, sans-serif';
         ctx.fillStyle = fast ? 'rgba(255,205,150,.95)' : 'rgba(185,215,255,.95)';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
-        ctx.fillText(`${speed}×`, (se[i].a + se[i].b + labelShift) / 2, laneY + laneH - 10);
+        ctx.fillText(label, (se[i].a + se[i].b + labelShift) / 2, laneY + laneH - 10);
         ctx.textAlign = 'start';
       }
 

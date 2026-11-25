@@ -40,15 +40,34 @@ for (const [n, next] of [
   ['speedDeleteSpot', 'deleteSpeedRegion'],
   ['deleteSpeedRegion', 'normalizeSpeeds'],
   ['normalizeSpeeds', 'speedTotal'],
+  ['speedRate', 'keptSegs'],
 ]) vm.runInContext(grab(n, next), sandbox);
+// the effective clamp lives next to speedRate in the app source
+vm.runInContext('const SPEED_EFFECTIVE_MIN = 0.1, SPEED_EFFECTIVE_MAX = 8;', sandbox);
 
-// overlapping regions: the newcomer keeps only what lies past the older one
+// overlapping regions are kept as drawn: they stack rather than truncate
 state.trims = [];
 state.speeds = [{ a: 0, b: 5, speed: 2 }, { a: 3, b: 8, speed: 4 }];
 sandbox.normalizeSpeeds();
 assert.equal(state.speeds.length, 2);
-assert.equal(state.speeds[1].a, 5);
+assert.equal(state.speeds[0].a, 0);
+assert.equal(state.speeds[0].b, 5);
+assert.equal(state.speeds[1].a, 3);
 assert.equal(state.speeds[1].b, 8);
+
+// and their factors multiply where they overlap
+state.speeds = [{ a: 0, b: 10, speed: 2 }, { a: 4, b: 6, speed: 2 }];
+assert.equal(sandbox.speedRate(1), 2);
+assert.equal(sandbox.speedRate(5), 4);
+assert.equal(sandbox.speedRate(9), 2);
+
+// stacking is clamped so the frame map stays expressible
+state.speeds = [
+  { a: 0, b: 2, speed: 4 },
+  { a: 0, b: 2, speed: 4 },
+  { a: 0, b: 2, speed: 4 },
+];
+assert.equal(sandbox.speedRate(1), 8);
 
 // speed is clamped into the supported range
 state.speeds = [{ a: 0, b: 2, speed: 99 }, { a: 3, b: 4, speed: 0.01 }];

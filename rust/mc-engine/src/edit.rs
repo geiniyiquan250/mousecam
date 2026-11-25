@@ -102,10 +102,18 @@ pub struct SpeedRegion {
     pub speed: f64,
 }
 
+/// One region's factor, as the picker offers it.
 pub const SPEED_MIN: f64 = 0.25;
 pub const SPEED_MAX: f64 = 4.0;
 
-/// Sorts, clamps and drops overlapping ranges: the last one dragged wins.
+/// What stacked regions may multiply out to. Wider than a single region so
+/// putting 2× on top of an already 2× span really is 4×; beyond this the frame
+/// map repeats or skips so much that the result stops reading as motion.
+pub const SPEED_EFFECTIVE_MIN: f64 = 0.1;
+pub const SPEED_EFFECTIVE_MAX: f64 = 8.0;
+
+/// Sorts and clamps. Overlaps are allowed and multiply, so a region laid over
+/// an already-sped span speeds it up further instead of replacing it.
 pub fn normalize_speeds(list: &mut Vec<SpeedRegion>) {
     list.retain(|s| s.b - s.a > 1e-6 && s.speed.is_finite());
     for s in list.iter_mut() {
@@ -113,29 +121,18 @@ pub fn normalize_speeds(list: &mut Vec<SpeedRegion>) {
         s.a = s.a.max(0.0);
     }
     list.sort_by(|x, y| x.a.partial_cmp(&y.a).unwrap_or(std::cmp::Ordering::Equal));
-    let mut merged: Vec<SpeedRegion> = Vec::with_capacity(list.len());
-    for s in list.drain(..) {
-        let overlap_end = merged.last().map_or(f64::NEG_INFINITY, |p| p.b);
-        if s.a < overlap_end - 1e-9 {
-            // older region keeps its span; the newcomer takes over after it
-            if s.b > overlap_end {
-                merged.push(SpeedRegion { a: overlap_end, b: s.b, speed: s.speed });
-            }
-        } else {
-            merged.push(s);
-        }
-    }
-    *list = merged;
 }
 
-/// The playback speed at source time `t`, 1.0 outside every region.
+/// The playback speed at source time `t`: the product of every region covering
+/// it, clamped to what the codecs can express. `1.0` outside every region.
 pub fn speed_at(speeds: &[SpeedRegion], t: f64) -> f64 {
+    let mut v = 1.0f64;
     for s in speeds {
         if t >= s.a && t < s.b {
-            return s.speed;
+            v *= s.speed;
         }
     }
-    1.0
+    v.clamp(SPEED_EFFECTIVE_MIN, SPEED_EFFECTIVE_MAX)
 }
 
 /// Splits `[a, b]` wherever a speed region boundary falls inside it, so each
@@ -595,14 +592,45 @@ mod speed_tests {
         assert!(*m.last().unwrap() <= 119);
     }
 
-    /// Overlapping regions are trimmed so the list stays sane.
+    /// Overlapping regions survive normalisation; they stack rather than
+    /// truncate, so a span can be sped up again without redrawing everything.
     #[test]
-    fn normalize_drops_the_overlap() {
+    fn normalize_keeps_the_overlap() {
         let mut v = vec![region(0.0, 5.0, 2.0), region(3.0, 8.0, 4.0)];
         normalize_speeds(&mut v);
         assert_eq!(v.len(), 2);
-        assert!((v[1].a - 5.0).abs() < 1e-9);
-        assert!((v[1].b - 8.0).abs() < 1e-9);
+        assert!((v[0].a - 0.0).abs() < 1e-9 && (v[0].b - 5.0).abs() < 1e-9);
+        assert!((v[1].a - 3.0).abs() < 1e-9 && (v[1].b - 8.0).abs() < 1e-9);
+    }
+
+    /// Two regions over one moment multiply: 2x on top of an already 2x span is
+    /// 4x, which is the whole point of stacking.
+    #[test]
+    fn stacked_regions_multiply() {
+        let sp = [region(0.0, 10.0, 2.0), region(4.0, 6.0, 2.0)];
+        assert!((speed_at(&sp, 1.0) - 2.0).abs() < 1e-9);
+        assert!((speed_at(&sp, 5.0) - 4.0).abs() < 1e-9);
+        assert!((speed_at(&sp, 9.0) - 2.0).abs() < 1e-9);
+        assert!((speed_at(&sp, 11.0) - 1.0).abs() < 1e-9);
+
+        // 20 s kept: 4 s at 2x, 2 s at 4x, 4 s at 2x... => 2+0.5+2+... measured
+        let segs = segs(&[(0.0, 10.0)]);
+        let want = 4.0 / 2.0 + 2.0 / 4.0 + 4.0 / 2.0;
+        assert!((output_duration(&segs, &sp) - want).abs() < 1e-9);
+    }
+
+    /// Stacking past what the frame map can express is clamped, not ignored.
+    #[test]
+    fn stacked_speed_is_clamped() {
+        let sp = [
+            region(0.0, 2.0, 4.0),
+            region(0.0, 2.0, 4.0),
+            region(0.0, 2.0, 4.0),
+        ];
+        assert!((speed_at(&sp, 1.0) - SPEED_EFFECTIVE_MAX).abs() < 1e-9);
+
+        let sp = [region(0.0, 2.0, 0.25), region(0.0, 2.0, 0.25), region(0.0, 2.0, 0.25)];
+        assert!((speed_at(&sp, 1.0) - SPEED_EFFECTIVE_MIN).abs() < 1e-9);
     }
 
     /// Parsing round-trips the line the UI writes.

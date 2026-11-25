@@ -31,6 +31,8 @@ for (const [n, next] of [
   ['srcToOut', 'playingWithProxy'],
   ['playingWithProxy', 'syncSpeedControls'],
 ]) vm.runInContext(grab(n, next), sandbox);
+// the stacked-speed clamp lives beside speedRate in the app source
+vm.runInContext('const SPEED_EFFECTIVE_MIN = 0.1, SPEED_EFFECTIVE_MAX = 8;', sandbox);
 
 // no edit: output seconds are source seconds
 assert.equal(sandbox.speedDuration(), 20);

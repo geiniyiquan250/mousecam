@@ -215,10 +215,13 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
     })(), out: '', format: 'mp4_h264', quality: 18, width: 0, fps: 0 });
     return r;
   })()`);
-  const m = String(msg).match(/([\d.]+)s\)/);
-  const exported = m ? parseFloat(m[1]) : -1;
+  // The message is "<path>  (<frames> 帧 / <secs>s / <size>)"; take the seconds
+  // and the size from those trailing fields.
+  const m = String(msg).match(/\((\d+) 帧 \/ ([\d.]+)s \/ ([^)]+)\)/);
+  const exported = m ? parseFloat(m[2]) : -1;
   const expected = t ? t.b - t.a : -1;
   check('导出时长等于裁切长度', Math.abs(exported - expected) < 0.35, `导出 ${exported}s / 裁切 ${expected.toFixed(2)}s`);
+  check('导出结果带文件体积', !!m && /\d+(\.\d+)?\s*(KB|MB)/.test(m[3]), m ? m[3] : 'no size field');
 
   // Leave the editor neutral: trim mode off, and no trim/keyframes pinning the
   // viewport, or the next suite's "changing a parameter moves the viewport"

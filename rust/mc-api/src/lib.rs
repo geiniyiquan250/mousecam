@@ -796,12 +796,28 @@ pub fn export(
             .arg(format!("/select,{}", sum.out_path.display()))
             .spawn();
     }
+    // The size is read off the finished file, so it includes the audio muxed
+    // after rendering and is the number the user sees in Explorer.
+    let size = std::fs::metadata(&sum.out_path).map(|m| m.len()).unwrap_or(0);
     Ok(format!(
-        "{}  ({} 帧 / {:.1}s)",
+        "{}  ({} 帧 / {:.1}s / {})",
         sum.out_path.display(),
         sum.frames,
-        sum.duration
+        sum.duration,
+        human_size(size)
     ))
+}
+
+fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes == 0 {
+        return "—".into();
+    }
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
 }
 
 

@@ -157,6 +157,22 @@ fn subpixel() -> bool {
     })
 }
 
+/// Where in the OUTPUT timeline a render starts and how much of it to write.
+///
+/// A long take takes minutes to bake in full, and only the stretch around the
+/// playhead is being watched, so the proxy is rendered in segments. Cutting on
+/// the output frame list is what keeps the segments seamless: every piece
+/// resolves its own source frames from the same map.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameRange {
+    pub start: i32,
+    pub count: i32,
+}
+
+impl FrameRange {
+    pub const ALL: FrameRange = FrameRange { start: 0, count: -1 };
+}
+
 pub fn render_clip(
     clip: &ClipInfo,
     ffmpeg: &Path,
@@ -165,6 +181,21 @@ pub fn render_clip(
     edit: &EditList,
     fmt: VideoFormat,
     crf: i32,
+    progress: impl FnMut(i32, i32) -> bool,
+) -> Result<RenderSummary, String> {
+    render_clip_range(clip, ffmpeg, out, s, edit, fmt, crf, FrameRange::ALL, progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_clip_range(
+    clip: &ClipInfo,
+    ffmpeg: &Path,
+    out: &Path,
+    s: &Settings,
+    edit: &EditList,
+    fmt: VideoFormat,
+    crf: i32,
+    range: FrameRange,
     mut progress: impl FnMut(i32, i32) -> bool,
 ) -> Result<RenderSummary, String> {
     let out_w = s.out_width & !1;
@@ -218,6 +249,20 @@ pub fn render_clip(
     if src_of_out.is_empty() {
         return Err("编辑清单没有产生任何帧".into());
     }
+    // A segment resolves its frames from the same map, so a proxy built this
+    // way lines up with a full render frame for frame.
+    let src_of_out: Vec<i32> = {
+        let start = range.start.max(0) as usize;
+        if start >= src_of_out.len() {
+            return Err("该区间超出成片长度".into());
+        }
+        let end = if range.count <= 0 {
+            src_of_out.len()
+        } else {
+            (start + range.count as usize).min(src_of_out.len())
+        };
+        src_of_out[start..end].to_vec()
+    };
 
     log_line(&format!(
         "edit trims={} speeds={} kf={}  ->  {} out frames ({:.2}s)",
@@ -232,9 +277,20 @@ pub fn render_clip(
         out_w, out_h, s.zoom, s.speed_expand, s.smooth, s.follow_hz
     ));
 
-    let mut reader = FrameReader::open(ffmpeg, &clip.master, None, clip.mon.w, clip.mon.h)
+    // A segment starts partway in; seeking the decoder there instead of reading
+    // and discarding everything before it is what makes per-segment baking
+    // worth doing at all.
+    let first_src = *src_of_out.first().unwrap_or(&0);
+    let seek_from = if range.start > 0 && first_src > 0 {
+        Some((first_src as f64 / clip.fps as f64).max(0.0))
+    } else {
+        None
+    };
+    let mut reader = FrameReader::open(ffmpeg, &clip.master, seek_from, clip.mon.w, clip.mon.h)
         .map_err(|e| format!("打开母片失败: {e}"))?;
     let mut writer = FrameWriter::open(ffmpeg, out, out_w, out_h, s.fps, fmt, crf)?;
+    // The reader now starts at `first_src`, so target indices are relative to it.
+    let src_base = if seek_from.is_some() { first_src } else { 0 };
 
     let sprite: Option<Sprite> = arrow_sprite();
     // The pointer drawn into the take is a look, not the record: smoothing it
@@ -256,11 +312,20 @@ pub fn render_clip(
     let t0 = Instant::now();
     let mut written = 0i32;
     let mut src_cur = 0i32;
+    // Announce the extent before the first frame: until this lands the UI can
+    // only say "starting", and on a long take that is the whole first minute.
+    if !progress(0, src_of_out.len() as i32) {
+        writer.abort();
+        let _ = std::fs::remove_file(out);
+        return Err("导出已取消".into());
+    }
     let total = src_of_out.len() as i32;
 
     for k in 0..total {
         let target = src_of_out[k as usize];
-        while src_cur <= target {
+        // `src_cur` counts frames delivered since the reader opened; `target`
+        // is absolute, so compare against the base the reader started at.
+        while src_cur + src_base <= target {
             if !reader.read_frame(&mut frame_buf) {
                 src_cur = -1;
                 break;
@@ -352,7 +417,7 @@ pub fn render_clip(
             break;
         }
         written += 1;
-        if (written % 30 == 0 || written == total) && !progress(written, total) {
+        if (written % 5 == 0 || written == total) && !progress(written, total) {
             // The caller wants to stop: kill the encoder before touching the
             // file, then remove it so nothing half-written looks finished.
             writer.abort();
@@ -440,5 +505,18 @@ mod pointer_tests {
     #[test]
     fn take_without_pointer_gets_one_composited() {
         assert!(should_composite_pointer(&clip(false)));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::FrameRange;
+
+    /// The whole-timeline form must not clip anything.
+    #[test]
+    fn all_range_keeps_every_frame() {
+        let r = FrameRange::ALL;
+        assert_eq!(r.start, 0);
+        assert!(r.count < 0, "a negative count means 'to the end'");
     }
 }

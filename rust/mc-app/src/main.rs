@@ -141,6 +141,21 @@ async fn render_proxy(dir: String, edit: String, height: u32) -> Result<String, 
 }
 
 #[tauri::command]
+async fn render_proxy_segment(
+    dir: String,
+    edit: String,
+    height: u32,
+    from_sec: f64,
+    to_sec: f64,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        mc_api::render_proxy_segment(dir, edit, height, from_sec, to_sec)
+    })
+    .await
+    .map_err(|e| format!("render_proxy_segment thread: {e}"))?
+}
+
+#[tauri::command]
 async fn preview_start(edit: String, monitor: Option<i32>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || mc_api::preview_start(edit, monitor))
         .await
@@ -564,6 +579,7 @@ fn main() {
             record_stop,
             record_status,
             render_proxy,
+            render_proxy_segment,
             media_path,
             preview_start,
             preview_stop,

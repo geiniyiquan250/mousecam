@@ -227,6 +227,23 @@ html, body {
 }
 .chip-quiet { background: transparent; border: 1px solid var(--line); color: var(--muted); }
 
+/* Generating a proxy on a long take runs for minutes, so it shows where it is. */
+.proxy-progress {
+  width: 90px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+  display: inline-block;
+}
+.proxy-progress i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: #4f8cff;
+  transition: width .2s linear;
+}
+
 .vp-body {
   position: relative;
   display: grid;

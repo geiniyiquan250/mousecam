@@ -1783,8 +1783,28 @@ async function generateProxy() {
   if (!state.clip || state.proxyBusy) return;
   state.proxyBusy = true;
   const btn = $('btnProxy');
+  const bar = $('proxyProgress');
+  const fill = $('proxyBar');
+  const pctEl = $('proxyPercent');
   btn.disabled = true;
   btn.textContent = '生成中…';
+  bar.classList.remove('is-hidden');
+  pctEl.classList.remove('is-hidden');
+  fill.style.width = '0%';
+  pctEl.textContent = '0%';
+
+  // Poll the same progress the exporter uses; it reports which render is
+  // running so an export in flight is not mistaken for this one.
+  const poll = setInterval(async () => {
+    try {
+      const p = await invoke('export_progress');
+      if (!p || !p.active || p.kind !== 'proxy') return;
+      const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+      fill.style.width = pct + '%';
+      pctEl.textContent = p.total ? `${pct}%` : '准备中…';
+    } catch {}
+  }, 250);
+
   try {
     await invoke('render_proxy', { dir: state.clip.dir, edit: editText(), height: 480 });
     await loadProxy(state.clip.dir);
@@ -1792,6 +1812,9 @@ async function generateProxy() {
   } catch (e) {
     toast('生成失败: ' + e, 3000);
   } finally {
+    clearInterval(poll);
+    bar.classList.add('is-hidden');
+    pctEl.classList.add('is-hidden');
     state.proxyBusy = false;
     btn.disabled = false;
     btn.textContent = '生成预览';

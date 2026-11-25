@@ -598,6 +598,8 @@ pub struct ProgressDto {
     pub active: bool,
     pub done: i32,
     pub total: i32,
+    /// "export" or "proxy" - the two share the counters but not the UI.
+    pub kind: String,
 }
 
 pub fn export_progress() -> ProgressDto {
@@ -605,7 +607,15 @@ pub fn export_progress() -> ProgressDto {
         active: EXPORT_ACTIVE.load(Ordering::Relaxed),
         done: EXPORT_DONE.load(Ordering::Relaxed),
         total: EXPORT_TOTAL.load(Ordering::Relaxed),
+        kind: render_kind().lock().map(|k| k.clone()).unwrap_or_default(),
     }
+}
+
+/// Which long render is running, so the bar can say what it is doing.
+static RENDER_KIND: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn render_kind() -> &'static Mutex<String> {
+    RENDER_KIND.get_or_init(|| Mutex::new(String::new()))
 }
 
 pub fn export_cancel() {
@@ -722,6 +732,9 @@ pub fn export(
     EXPORT_DONE.store(0, Ordering::Relaxed);
     EXPORT_TOTAL.store(0, Ordering::Relaxed);
     EXPORT_CANCEL.store(false, Ordering::Relaxed);
+    if let Ok(mut k) = render_kind().lock() {
+        *k = "export".into();
+    }
     EXPORT_ACTIVE.store(true, Ordering::Relaxed);
     let rendered = mc_engine::render_clip(
         &clip,
@@ -1192,6 +1205,59 @@ pub fn record_stop() -> Result<String, String> {
 //  Proxy render (low-res cut used for smooth playback)
 // ============================================================
 
+/// Renders one output-time slice of the proxy.
+///
+/// A long take takes minutes to bake end to end, and only the stretch being
+/// watched matters, so the proxy is built in segments: the caller names the
+/// output second to cover and gets a file back. Segment indices are exclusive,
+/// so two calls cannot write the same file.
+#[allow(clippy::too_many_arguments)]
+pub fn render_proxy_segment(
+    dir: String,
+    edit: String,
+    height: u32,
+    from_sec: f64,
+    to_sec: f64,
+) -> Result<String, String> {
+    let clip = load_clip(std::path::Path::new(&dir))?;
+    let ff = find_ffmpeg().ok_or("找不到 ffmpeg.exe")?;
+    let (mut s, e) = build_settings(&dir, &edit)?;
+
+    let h = (height.clamp(180, 1080)) & !1;
+    let aspect = mc_engine::settings::aspect_value(s.aspect_idx);
+    s.out_width = ((h as f32 * aspect).round() as i32).max(16) & !1;
+
+    let start = (from_sec.max(0.0) * s.fps as f64).floor() as i32;
+    let count = (((to_sec.max(0.0) - from_sec.max(0.0)) * s.fps as f64).round() as i32).max(1);
+    let out = PathBuf::from(&dir).join(format!("proxy_{:07}.mp4", start));
+
+    EXPORT_DONE.store(0, Ordering::Relaxed);
+    EXPORT_TOTAL.store(0, Ordering::Relaxed);
+    EXPORT_CANCEL.store(false, Ordering::Relaxed);
+    if let Ok(mut k) = render_kind().lock() {
+        *k = "proxy".into();
+    }
+    EXPORT_ACTIVE.store(true, Ordering::Relaxed);
+    let rendered = mc_engine::render::render_clip_range(
+        &clip,
+        &ff,
+        &out,
+        &s,
+        &e,
+        mc_engine::ffmpeg::VideoFormat::Mp4H264,
+        30,
+        mc_engine::render::FrameRange { start, count },
+        |done, total| {
+            EXPORT_DONE.store(done, Ordering::Relaxed);
+            EXPORT_TOTAL.store(total, Ordering::Relaxed);
+            !EXPORT_CANCEL.load(Ordering::Relaxed)
+        },
+    );
+    EXPORT_ACTIVE.store(false, Ordering::Relaxed);
+    let sum = rendered?;
+    Ok(format!("{}|{}", out.display(), sum.frames))
+}
+
 pub fn render_proxy(dir: String, edit: String, height: u32) -> Result<String, String> {
     let clip = load_clip(std::path::Path::new(&dir))?;
     let ff = find_ffmpeg().ok_or("找不到 ffmpeg.exe")?;
@@ -1202,7 +1268,16 @@ pub fn render_proxy(dir: String, edit: String, height: u32) -> Result<String, St
     s.out_width = ((h as f32 * aspect).round() as i32).max(16) & !1;
 
     let out = PathBuf::from(&dir).join("proxy.mp4");
-    let _sum = mc_engine::render_clip(
+    // A long take takes minutes here, so it reports progress and can be
+    // cancelled the same way an export can.
+    EXPORT_DONE.store(0, Ordering::Relaxed);
+    EXPORT_TOTAL.store(0, Ordering::Relaxed);
+    EXPORT_CANCEL.store(false, Ordering::Relaxed);
+    if let Ok(mut k) = render_kind().lock() {
+        *k = "proxy".into();
+    }
+    EXPORT_ACTIVE.store(true, Ordering::Relaxed);
+    let rendered = mc_engine::render_clip(
         &clip,
         &ff,
         &out,
@@ -1210,8 +1285,14 @@ pub fn render_proxy(dir: String, edit: String, height: u32) -> Result<String, St
         &e,
         mc_engine::ffmpeg::VideoFormat::Mp4H264,
         30,
-        |_, _| true,
-    )?;
+        |done, total| {
+            EXPORT_DONE.store(done, Ordering::Relaxed);
+            EXPORT_TOTAL.store(total, Ordering::Relaxed);
+            !EXPORT_CANCEL.load(Ordering::Relaxed)
+        },
+    );
+    EXPORT_ACTIVE.store(false, Ordering::Relaxed);
+    rendered?;
     Ok(out.display().to_string())
 }
 
@@ -1233,6 +1314,45 @@ pub fn media_path(dir: String, which: String) -> Result<String, String> {
 
 pub fn proxy_exists(dir: String) -> bool {
     PathBuf::from(&dir).join("proxy.mp4").is_file()
+}
+
+/// The proxy segment that covers a given output second, as
+/// `{"path": ..., "start": <output seconds>}`, or `None` when nothing covers it.
+///
+/// Segments are named after their first output frame, so the covering one is
+/// the last whose name sorts at or before the requested time.
+#[derive(Serialize)]
+pub struct ProxySegmentDto {
+    pub path: String,
+    pub start: f64,
+}
+
+pub fn proxy_segment_at(dir: String, out_sec: f64, fps: i32) -> Option<ProxySegmentDto> {
+    let base = PathBuf::from(&dir);
+    let fps = fps.max(1);
+    let want = (out_sec.max(0.0) * fps as f64).floor() as i64;
+    let mut best: Option<(i64, PathBuf)> = None;
+    let entries = std::fs::read_dir(&base).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("proxy_") else { continue };
+        let Some(num) = rest.strip_suffix(".mp4") else { continue };
+        let Ok(start) = num.parse::<i64>() else { continue };
+        if start <= want && best.as_ref().map_or(true, |(s, _)| start > *s) {
+            best = Some((start, entry.path()));
+        }
+    }
+    let (start, path) = best?;
+    // Refuse a segment whose end is already behind the request: the caller has
+    // to bake the next one rather than show a stale frame.
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.len() < 1024 {
+        return None;
+    }
+    Some(ProxySegmentDto {
+        path: path.display().to_string(),
+        start: start as f64 / fps as f64,
+    })
 }
 
 

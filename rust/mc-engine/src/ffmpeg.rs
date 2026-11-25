@@ -336,6 +336,13 @@ impl FrameReader {
             cmd.args(["-ss", &format!("{:.6}", (t - 0.001).max(0.0))]);
         }
         cmd.args(["-i"]).arg(input);
+        if let Some(t) = seek {
+            // Seeking before -i fast-seeks to the nearest keyframe, which would
+            // hand back frames from before the segment starts. Seeking again
+            // after the input makes ffmpeg decode and discard up to the exact
+            // frame, so the first frame out really is the one asked for.
+            cmd.args(["-ss", &format!("{:.6}", (t - 0.001).max(0.0))]);
+        }
         if let Some((sw, sh)) = scale {
             cmd.args(["-vf", &format!("scale={}:{}", sw, sh)]);
         }

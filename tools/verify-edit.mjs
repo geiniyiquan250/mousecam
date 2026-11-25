@@ -147,17 +147,21 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
   await cdp.shot(path.join(outDir, '48_keyframes.png'));
 
   // ---------- 3) proxy ----------
-  const hadProxy = await cdp.eval(`window.__mc.proxyReady`);
+  // The proxy is baked in segments around the playhead, so what matters is that
+  // a segment exists and the follow view is playing it.
+  const hadProxy = await cdp.eval(`window.__mc.proxySegs.length > 0`);
   if (!hadProxy) {
     await cdp.eval(`document.getElementById('btnProxy').click()`);
-    for (let i = 0; i < 120; i++) {
-      if (await cdp.eval(`window.__mc.proxyReady`)) break;
+    for (let i = 0; i < 150; i++) {
+      if (await cdp.eval(`window.__mc.proxySegs.length > 0`)) break;
       await sleep(1000);
     }
   }
-  const proxyOk = await cdp.eval(`window.__mc.proxyReady`);
-  const videoOn = await cdp.eval(`document.getElementById('cropVideo').classList.contains('is-on')`);
-  check('代理视频就绪', proxyOk === true);
+  const segCount = await cdp.eval(`window.__mc.proxySegs.length`);
+  const videoOn = await cdp.eval(
+    `['cropVideo','cropVideoB'].some(id => document.getElementById(id).classList.contains('is-on'))`
+  );
+  check('代理分段已就绪', segCount > 0, `${segCount} 段`);
   check('跟拍视口使用视频', videoOn === true);
   await cdp.shot(path.join(outDir, '49_proxy.png'));
 
@@ -167,7 +171,9 @@ const rect = (cdp, id) => cdp.eval(`(() => { const r = document.getElementById('
   await cdp.eval(`(() => { const s = window.__mc; const fps = s.bake ? s.bake.fps : 30;
     const start = Math.floor((s.bake ? s.bake.frames : 60) * 0.25);
     s.frame = start;
-    for (const el of [document.getElementById('viewVideo'), document.getElementById('cropVideo')]) {
+    for (const el of [document.getElementById('viewVideo'),
+                      document.getElementById('cropVideo'),
+                      document.getElementById('cropVideoB')]) {
       try { el.currentTime = start / fps; } catch {}
     } })()`);
   await sleep(350);

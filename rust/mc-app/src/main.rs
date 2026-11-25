@@ -156,6 +156,21 @@ async fn render_proxy_segment(
 }
 
 #[tauri::command]
+async fn proxy_segment_at(dir: String, out_sec: f64, fps: i32) -> Option<mc_api::ProxySegmentDto> {
+    tauri::async_runtime::spawn_blocking(move || mc_api::proxy_segment_at(dir, out_sec, fps))
+        .await
+        .ok()
+        .flatten()
+}
+
+#[tauri::command]
+async fn proxy_segment_list(dir: String, fps: i32) -> Vec<mc_api::ProxySegmentDto> {
+    tauri::async_runtime::spawn_blocking(move || mc_api::proxy_segment_list(dir, fps))
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 async fn preview_start(edit: String, monitor: Option<i32>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || mc_api::preview_start(edit, monitor))
         .await
@@ -580,6 +595,8 @@ fn main() {
             record_status,
             render_proxy,
             render_proxy_segment,
+            proxy_segment_at,
+            proxy_segment_list,
             media_path,
             preview_start,
             preview_stop,

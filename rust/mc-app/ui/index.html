@@ -91,6 +91,10 @@
         </div>
         <div class="vp-body" id="cropWrap">
           <video id="cropVideo" class="vp-media" muted playsinline></video>
+          <!-- The second element holds the next baked segment, preloaded and
+               already seeked, so crossing a boundary swaps visibility instead
+               of loading a file in front of the user. -->
+          <video id="cropVideoB" class="vp-media" muted playsinline></video>
           <canvas id="cropCanvas"></canvas>
           <div class="vp-empty" id="cropEmpty">—</div>
         </div>

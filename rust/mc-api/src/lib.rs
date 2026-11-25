@@ -1230,6 +1230,18 @@ pub fn render_proxy_segment(
     let start = (from_sec.max(0.0) * s.fps as f64).floor() as i32;
     let count = (((to_sec.max(0.0) - from_sec.max(0.0)) * s.fps as f64).round() as i32).max(1);
     let out = PathBuf::from(&dir).join(format!("proxy_{:07}.mp4", start));
+    // Drop any segment this one will overlap. Baking around the playhead leaves
+    // pieces that partly cover each other, and overlapping segments make "which
+    // one covers this second" ambiguous.
+    let new_from = start as f64 / s.fps as f64;
+    let new_to = (start + count) as f64 / s.fps as f64;
+    for seg in proxy_segment_list(dir.clone(), s.fps) {
+        let a = seg.start;
+        let b = seg.start + seg.duration;
+        if b > new_from + 1e-3 && a < new_to - 1e-3 && seg.path != out.display().to_string() {
+            let _ = std::fs::remove_file(&seg.path);
+        }
+    }
 
     EXPORT_DONE.store(0, Ordering::Relaxed);
     EXPORT_TOTAL.store(0, Ordering::Relaxed);
@@ -1324,34 +1336,72 @@ pub fn proxy_exists(dir: String) -> bool {
 #[derive(Serialize)]
 pub struct ProxySegmentDto {
     pub path: String,
+    /// Output second the segment starts at.
     pub start: f64,
+    /// How long the segment runs, so the caller knows when to switch.
+    pub duration: f64,
 }
 
-pub fn proxy_segment_at(dir: String, out_sec: f64, fps: i32) -> Option<ProxySegmentDto> {
-    let base = PathBuf::from(&dir);
-    let fps = fps.max(1);
-    let want = (out_sec.max(0.0) * fps as f64).floor() as i64;
-    let mut best: Option<(i64, PathBuf)> = None;
-    let entries = std::fs::read_dir(&base).ok()?;
+fn proxy_segments(dir: &PathBuf, fps: i32) -> Vec<(i64, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(rest) = name.strip_prefix("proxy_") else { continue };
         let Some(num) = rest.strip_suffix(".mp4") else { continue };
         let Ok(start) = num.parse::<i64>() else { continue };
-        if start <= want && best.as_ref().map_or(true, |(s, _)| start > *s) {
-            best = Some((start, entry.path()));
+        let ok = entry.metadata().map(|m| m.len() > 1024).unwrap_or(false);
+        if ok {
+            out.push((start, entry.path()));
         }
     }
-    let (start, path) = best?;
-    // Refuse a segment whose end is already behind the request: the caller has
-    // to bake the next one rather than show a stale frame.
-    let meta = std::fs::metadata(&path).ok()?;
-    if meta.len() < 1024 {
+    out.sort_by_key(|(s, _)| *s);
+    let _ = fps;
+    out
+}
+
+/// Every baked segment, so the UI can tell which stretches are ready.
+pub fn proxy_segment_list(dir: String, fps: i32) -> Vec<ProxySegmentDto> {
+    let base = PathBuf::from(&dir);
+    let fps = fps.max(1);
+    let segs = proxy_segments(&base, fps);
+    let ff = find_ffmpeg();
+    segs.iter()
+        .map(|(start, path)| {
+            let duration = ff
+                .as_ref()
+                .map(|f| mc_engine::ffmpeg::media_duration(f, path))
+                .unwrap_or(0.0);
+            ProxySegmentDto {
+                path: path.display().to_string(),
+                start: *start as f64 / fps as f64,
+                duration,
+            }
+        })
+        .collect()
+}
+
+/// The baked segment covering an output second, if one exists.
+pub fn proxy_segment_at(dir: String, out_sec: f64, fps: i32) -> Option<ProxySegmentDto> {
+    let base = PathBuf::from(&dir);
+    let fps = fps.max(1);
+    let want = (out_sec.max(0.0) * fps as f64).floor() as i64;
+    let (start, path) = proxy_segments(&base, fps)
+        .into_iter()
+        .filter(|(s, _)| *s <= want)
+        .next_back()?;
+    let duration = find_ffmpeg()
+        .map(|f| mc_engine::ffmpeg::media_duration(&f, &path))
+        .unwrap_or(0.0);
+    let from = start as f64 / fps as f64;
+    // Behind the segment's end means it cannot show this second.
+    if duration > 0.0 && out_sec > from + duration {
         return None;
     }
     Some(ProxySegmentDto {
         path: path.display().to_string(),
-        start: start as f64 / fps as f64,
+        start: from,
+        duration,
     })
 }
 

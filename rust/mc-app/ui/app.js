@@ -126,6 +126,13 @@ const state = {
   proxyReady: false,
   proxyStale: false,
   useVideo: false,
+  // Baked proxy segments, in output seconds: [{start, duration, path}]. The
+  // proxy is built around the playhead rather than end to end, so only part of
+  // a long take is normally ready.
+  proxySegs: [],
+  proxySeg: null,       // the segment the active element is playing
+  proxyActive: 'a',     // which <video> is showing: 'a' or 'b'
+  proxyBaking: null,    // {from, to} while a segment is being rendered
   // Baked stills, keyed by output second. A still costs one ffmpeg decode
   // (~250 ms); replaying the same stretch would otherwise pay that again for
   // every frame. Dropped whenever the edit changes.
@@ -936,7 +943,7 @@ function scheduleRebake() {
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
     await rebake();
-    state.proxyStale = true;
+    invalidateProxy();
     $('btnProxy').classList.add('is-on');
     drawLeft();
     scheduleStill();
@@ -951,7 +958,7 @@ function onParamChanged() {
   clearTimeout(rebakeTimer);
   rebakeTimer = setTimeout(async () => {
     await rebake();
-    state.proxyStale = true;
+    invalidateProxy();
     $('btnProxy').classList.add('is-on');
     drawLeft();
     scheduleStill();
@@ -1178,6 +1185,7 @@ async function selectClip(dir) {
   state.undoStack.length = 0;
   state.redoStack.length = 0;
   $('cropVideo').classList.remove('is-on');
+  $('cropVideoB').classList.remove('is-on');
   await rebake();
   await setupMedia();
   drawTimeline();
@@ -1232,16 +1240,25 @@ async function fetchStill(kind, maxW, frame = state.frame) {
 // the source second to both is what made a sped-up proxy show the wrong frame.
 function seekVideos(t) {
   const v = $('viewVideo');
-  const c = $('cropVideo');
   if (v.classList.contains('is-on') && Math.abs(v.currentTime - t) > 0.02) {
     try { v.currentTime = t; } catch {}
   }
-  if (c.classList.contains('is-on') && playingWithProxy()) {
-    const o = srcToOut(t);
-    if (Math.abs(c.currentTime - o) > 0.02) {
-      try { c.currentTime = o; } catch {}
-    }
-  }
+  // The proxy is a set of segments, so a seek may need a different file rather
+  // than just a new position. syncProxyTo picks it and swaps if required.
+  if (playingWithProxy()) queueProxySync(srcToOut(t));
+}
+
+// Seeking fires far faster than a segment can be loaded, so requests are
+// coalesced: only the newest position matters.
+let proxySyncTimer = 0;
+function queueProxySync(outSec) {
+  state.proxyWantOut = outSec;
+  if (proxySyncTimer) return;
+  proxySyncTimer = setTimeout(() => {
+    proxySyncTimer = 0;
+    const want = state.proxyWantOut;
+    syncProxyTo(want).catch(() => {});
+  }, 60);
 }
 
 // Anything that changes what a still would look like invalidates the cache.
@@ -1756,32 +1773,178 @@ async function setupMedia() {
     $('viewVideo').classList.remove('is-on');
   }
 
-  await loadProxy(dir);
-}
-
-async function loadProxy(dir) {
-  try {
-    const pp = await invoke('media_path', { dir, which: 'proxy' });
-    const cv = $('cropVideo');
-    // cache-buster: the proxy is rewritten when regenerated
-    cv.src = mediaUrl(pp) + (mediaUrl(pp).startsWith('/media') ? '&v=' : '?v=') + Date.now();
-    cv.onloadedmetadata = () => {
-      cv.classList.add('is-on');
-      state.proxyReady = true;
-      state.proxyStale = false;
-      $('btnProxy').classList.remove('is-on');
-      seekVideos(state.frame / (state.bake ? state.bake.fps : 30));
-      drawRight();
-    };
-  } catch {
-    state.proxyReady = false;
-    $('cropVideo').classList.remove('is-on');
+  await refreshProxySegments();
+  if (state.proxySegs.length) {
+    await syncProxyTo(srcToOut(state.frame / outputFps()));
+    drawRight();
   }
 }
 
-async function generateProxy() {
-  if (!state.clip || state.proxyBusy) return;
+function proxyVideoEl(which) {
+  return which === 'b' ? $('cropVideoB') : $('cropVideo');
+}
+
+function activeProxyEl() {
+  return proxyVideoEl(state.proxyActive);
+}
+
+function idleProxyEl() {
+  return proxyVideoEl(state.proxyActive === 'a' ? 'b' : 'a');
+}
+
+function outputFps() {
+  return state.bake ? state.bake.fps : 30;
+}
+
+// Re-reads the baked segments. Cheap: it only stats files, and the durations
+// come back from the backend in one call.
+async function refreshProxySegments() {
+  if (!state.clip) return;
+  try {
+    const segs = await invoke('proxy_segment_list', {
+      dir: state.clip.dir,
+      fps: outputFps(),
+    });
+    state.proxySegs = Array.isArray(segs) ? segs : [];
+  } catch {
+    state.proxySegs = [];
+  }
+  state.proxyReady = state.proxySegs.length > 0;
+  if (!state.proxyReady) {
+    $('cropVideo').classList.remove('is-on');
+    $('cropVideoB').classList.remove('is-on');
+    state.proxySeg = null;
+  }
+}
+
+// Marks the baked segments unusable. They were rendered from an older edit, so
+// they must stop being played and must not be counted as covering anything.
+function invalidateProxy() {
+  state.proxyStale = true;
+  state.proxySegs = [];
+  state.proxySeg = null;
+  state.proxyReady = false;
+  showProxyElement('a', false);
+  showProxyElement('b', false);
+}
+
+// Which baked segment covers an output second, if any.
+function segmentAt(outSec) {
+  let hit = null;
+  for (const s of state.proxySegs) {
+    if (s.start <= outSec + 1e-6) {
+      if (!hit || s.start > hit.start) hit = s;
+    }
+  }
+  if (!hit) return null;
+  if (hit.duration > 0 && outSec > hit.start + hit.duration) return null;
+  return hit;
+}
+
+// Points the named element at a segment and seeks it to an output second.
+function loadSegmentInto(which, seg, outSec) {
+  const el = proxyVideoEl(which);
+  const url = mediaUrl(seg.path);
+  const bust = url.startsWith('/media') ? '&v=' : '?v=';
+  el.src = url + bust + Date.now();
+  el.onloadedmetadata = () => {
+    el.currentTime = Math.max(0, Math.min(seg.duration || 1e9, outSec - seg.start));
+  };
+  return el;
+}
+
+function showProxyElement(which, show) {
+  proxyVideoEl(which).classList.toggle('is-on', show);
+}
+
+/**
+ * Makes the right pane show the segment covering `outSec`, swapping elements so
+ * the change is a visibility flip rather than a load.
+ */
+async function syncProxyTo(outSec) {
+  const seg = segmentAt(outSec);
+  if (!seg) {
+    // Nothing baked here: drop back to the still, and start baking around the
+    // playhead if nothing is already in flight.
+    state.proxySeg = null;
+    state.proxyReady = false;
+    showProxyElement(state.proxyActive, false);
+    showProxyElement(state.proxyActive === 'a' ? 'b' : 'a', false);
+    maybeBakeAround(outSec);
+    return false;
+  }
+  state.proxyReady = true;
+  if (state.proxySeg && state.proxySeg.path === seg.path) {
+    // Same segment: just follow the clock.
+    const el = activeProxyEl();
+    const local = outSec - seg.start;
+    if (el.readyState >= 1 && Math.abs(el.currentTime - local) > 0.25 && !state.playing) {
+      try { el.currentTime = local; } catch {}
+    }
+    return true;
+  }
+  // Different segment: load it into the idle element, then flip.
+  const target = state.proxyActive === 'a' ? 'b' : 'a';
+  const el = loadSegmentInto(target, seg, outSec);
+  await new Promise((res) => {
+    if (el.readyState >= 1) return res();
+    const done = () => res();
+    el.addEventListener('loadedmetadata', done, { once: true });
+    el.addEventListener('error', done, { once: true });
+    setTimeout(done, 1500);
+  });
+  showProxyElement(target, true);
+  showProxyElement(state.proxyActive, false);
+  state.proxyActive = target;
+  state.proxySeg = seg;
+  if (state.playing) el.play().catch(() => {});
+  return true;
+}
+
+// How much of the timeline a single bake covers, either side of where it
+// starts. A long take takes minutes end to end, and only the stretch around
+// the playhead is being watched.
+const PROXY_WINDOW_SEC = 30;
+
+function proxyTotalOutput() {
+  const d = speedDuration();
+  return d > 0 ? d : state.clip ? state.clip.duration : 0;
+}
+
+// Bake around an output second when that second itself is not covered. Asking
+// for a whole window first would rebuild stretches that already exist, which on
+// a long take is minutes of work for nothing.
+async function maybeBakeAround(outSec) {
+  if (!state.clip || state.proxyBusy || state.proxyStale) return;
+  const total = proxyTotalOutput();
+  if (total <= 0) return;
+  if (segmentAt(outSec)) return;
+  // Start from the playhead so the wait is for the picture being looked at,
+  // and run forward from there.
+  const { from, to } = gridRange(outSec, total);
+  await bakeSegment(from, to);
+}
+
+// Segment edges sit on a fixed grid so a bake always produces the same pieces.
+// Baking from wherever the playhead happened to be left fragments that partly
+// covered each other and made "which piece covers this second" ambiguous.
+function gridRange(outSec, total) {
+  const i = Math.max(0, Math.floor(outSec / PROXY_WINDOW_SEC));
+  const from = i * PROXY_WINDOW_SEC;
+  return { from, to: Math.min(total, from + PROXY_WINDOW_SEC) };
+}
+
+async function bakeSegment(fromSec, toSec) {
+  if (!state.clip) return;
+  if (state.proxyBusy) {
+    // A second bake has to be told rather than silently dropped, or the button
+    // looks dead while the first one runs.
+    toast('已有预览正在生成，请稍候', 2200);
+    return;
+  }
+  if (toSec - fromSec < 0.5) return;
   state.proxyBusy = true;
+  state.proxyBaking = { from: fromSec, to: toSec };
   const btn = $('btnProxy');
   const bar = $('proxyProgress');
   const fill = $('proxyBar');
@@ -1793,8 +1956,6 @@ async function generateProxy() {
   fill.style.width = '0%';
   pctEl.textContent = '0%';
 
-  // Poll the same progress the exporter uses; it reports which render is
-  // running so an export in flight is not mistaken for this one.
   const poll = setInterval(async () => {
     try {
       const p = await invoke('export_progress');
@@ -1806,9 +1967,34 @@ async function generateProxy() {
   }, 250);
 
   try {
-    await invoke('render_proxy', { dir: state.clip.dir, edit: editText(), height: 480 });
-    await loadProxy(state.clip.dir);
-    toast('预览已生成', 1600);
+    await invoke('render_proxy_segment', {
+      dir: state.clip.dir,
+      edit: editText(),
+      height: 480,
+      fromSec,
+      toSec,
+    });
+    // The segments just written match the edit as it stands, so the stale flag
+    // from an earlier parameter change no longer applies to them.
+    state.proxyStale = false;
+    $('btnProxy').classList.remove('is-on');
+    await refreshProxySegments();
+    // Land on something that exists. If the playhead's own stretch has no
+    // segment - it moved during the bake, or the edit shifted - falling back to
+    // the nearest one beats showing nothing after a multi-second wait.
+    const out = srcToOut(state.frame / outputFps());
+    if (!segmentAt(out) && state.proxySegs.length) {
+      let best = state.proxySegs[0];
+      for (const s of state.proxySegs) {
+        if (Math.abs(s.start - out) < Math.abs(best.start - out)) best = s;
+      }
+      state.frame = Math.round(outToSrc(best.start) * outputFps());
+      playOutT = best.start;
+      playOutAtStart = best.start;
+      drawTimeline();
+      drawLeft();
+    }
+    await syncProxyTo(srcToOut(state.frame / outputFps()));
   } catch (e) {
     toast('生成失败: ' + e, 3000);
   } finally {
@@ -1816,9 +2002,21 @@ async function generateProxy() {
     bar.classList.add('is-hidden');
     pctEl.classList.add('is-hidden');
     state.proxyBusy = false;
+    state.proxyBaking = null;
     btn.disabled = false;
     btn.textContent = '生成预览';
   }
+}
+
+async function generateProxy() {
+  // The button bakes the window around the playhead. On its own that is all the
+  // proxy is for: the stretch being watched, not the whole take.
+  if (!state.clip || state.proxyBusy) return;
+  const out = srcToOut(state.frame / outputFps());
+  const total = proxyTotalOutput();
+  const { from, to } = gridRange(out, total);
+  await bakeSegment(from, to);
+  if (state.proxySegs.length) toast(`已烘焙 ${(to - from).toFixed(0)}s 预览`, 1800);
 }
 
 /* ---------------- timeline ---------------- */
@@ -2072,7 +2270,7 @@ function srcToOut(srcT) {
 
 // The baked proxy already carries trims and speeds; the raw master does not.
 function playingWithProxy() {
-  return state.proxyReady && !state.proxyStale;
+  return state.proxyReady && !state.proxyStale && state.proxySegs.length > 0;
 }
 
 
@@ -2790,7 +2988,7 @@ function markTrimDirty() {
   scheduleSaveEdit();
   // Trims AND speed regions change what the baked proxy should show, so it has
   // to be rebuilt; otherwise the right viewport keeps playing the old timeline.
-  state.proxyStale = true;
+  invalidateProxy();
   const pb = $('btnProxy');
   if (pb) pb.classList.add('is-on');
   clearTimeout(trimTimer);
@@ -2863,7 +3061,7 @@ function maxPlaybackRate(el) {
 
 function playVideos(on) {
   const v = $('viewVideo');
-  const c = $('cropVideo');
+  const c = activeProxyEl();
   const fps = state.bake ? state.bake.fps : 30;
   if (on) {
     // Where in the output timeline the playhead currently is.
@@ -2909,12 +3107,26 @@ function tickVideo() {
   const fps = state.bake ? state.bake.fps : 30;
   const last = (state.bake ? state.bake.frames : 1) - 1;
   const v = $('viewVideo');
-  const c = $('cropVideo');
+  const c = activeProxyEl();
 
   // Advance the output clock. With a proxy the element is authoritative (it is
   // the baked timeline); otherwise wall time drives it and the master follows.
-  if (playingWithProxy() && c.readyState >= 2) {
-    playOutT = c.currentTime;
+  const seg = state.proxySeg;
+  if (playingWithProxy() && seg && c.readyState >= 2) {
+    // The segment is a window of the output timeline, so its own clock has to
+    // be shifted by where it starts.
+    playOutT = seg.start + c.currentTime;
+    const ends = seg.start + (seg.duration || 0);
+    if (seg.duration > 0 && playOutT >= ends - 0.15) {
+      // About to run off the end of this segment: move to the next one, baking
+      // it first if it has not been made yet.
+      const next = segmentAt(ends + 0.02);
+      if (next) {
+        syncProxyTo(ends + 0.02).catch(() => {});
+      } else {
+        maybeBakeAround(ends + PROXY_WINDOW_SEC * 0.5);
+      }
+    }
   } else {
     playOutT = playOutAtStart + (performance.now() - playOutStart) / 1000;
   }
@@ -3026,10 +3238,13 @@ function replayFromStart() {
   playOutAtStart = 0;
   playOutT = 0;
   playOutStart = performance.now();
-  for (const el of [$('viewVideo'), $('cropVideo')]) {
+  for (const el of [$('viewVideo'), activeProxyEl()]) {
     if (!el.classList.contains('is-on')) continue;
+    // The proxy segment may not start at output zero, so "the beginning" for it
+    // is its own first frame.
+    const isProxy = el === activeProxyEl();
     try {
-      el.currentTime = el === $('cropVideo') ? 0 : src0;
+      el.currentTime = isProxy ? 0 : src0;
       if (state.playing) el.play().catch(() => {});
     } catch {}
   }
@@ -3051,6 +3266,7 @@ function onPlaybackEnd() {
 
 $('viewVideo').addEventListener('ended', onPlaybackEnd);
 $('cropVideo').addEventListener('ended', onPlaybackEnd);
+$('cropVideoB').addEventListener('ended', onPlaybackEnd);
 
 function togglePlay() {
   if (state.playing) {
@@ -3062,7 +3278,7 @@ function togglePlay() {
   const last = (state.bake ? state.bake.frames : 1) - 1;
   if (state.frame >= last) {
     state.frame = 0;
-    for (const el of [$('viewVideo'), $('cropVideo')]) {
+    for (const el of [$('viewVideo'), activeProxyEl()]) {
       if (el.classList.contains('is-on')) { try { el.currentTime = 0; } catch {} }
     }
     drawTimeline();

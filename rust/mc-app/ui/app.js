@@ -2812,6 +2812,32 @@ function pieceAt(outT) {
   return p[p.length - 1];
 }
 
+// Chromium accepts playbackRate up to 16 and throws beyond it, but the bound
+// is not part of any spec, so it is probed once against the element rather than
+// hard-coded - clamping below what the engine allows was what made a stacked
+// 8x region drift and re-seek on every frame.
+let rateCeiling = 0;
+
+function maxPlaybackRate(el) {
+  if (rateCeiling) return rateCeiling;
+  const probe = el || document.createElement('video');
+  const saved = probe.playbackRate;
+  let lo = 1;
+  let hi = 32;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    try {
+      probe.playbackRate = mid;
+      lo = mid;
+    } catch {
+      hi = mid - 1;
+    }
+  }
+  try { probe.playbackRate = saved; } catch {}
+  rateCeiling = Math.max(1, lo);
+  return rateCeiling;
+}
+
 function playVideos(on) {
   const v = $('viewVideo');
   const c = $('cropVideo');
@@ -2838,9 +2864,10 @@ function playVideos(on) {
     } else {
       // No proxy: the master is the moving picture, so it plays at the region's
       // rate. tickVideo re-syncs it whenever the rate changes.
+      const cap = maxPlaybackRate(v);
       try {
         v.currentTime = at;
-        v.playbackRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
+        v.playbackRate = Math.min(cap, Math.max(0.25, piece ? piece.speed : 1));
         v.play().catch(() => {});
       } catch {}
     }
@@ -2883,14 +2910,15 @@ function tickVideo() {
     // seek per frame starved the decoder and the picture stopped updating
     // altogether.
     const want = piece ? piece.speed : 1;
-    const rate = Math.min(4, Math.max(0.25, want));
+    const cap = maxPlaybackRate(v);
+    const rate = Math.min(cap, Math.max(0.25, want));
     if (Math.abs(v.playbackRate - rate) > 1e-3) {
       try { v.playbackRate = rate; } catch {}
     }
-    // Beyond 4x the element cannot keep up on its own, so a periodic nudge is
-    // the only way to stay near the playhead.
+    // Above the engine's ceiling the element cannot keep up on its own, so a
+    // periodic nudge is the only correction left.
     const drift = Math.abs(v.currentTime - srcT);
-    if (++masterSeekTick % 6 === 0 && drift > (want > 4 ? 1.0 : 0.35)) {
+    if (++masterSeekTick % 6 === 0 && drift > (want > cap ? 1.0 : 0.35)) {
       try { v.currentTime = srcT; } catch {}
     }
   }

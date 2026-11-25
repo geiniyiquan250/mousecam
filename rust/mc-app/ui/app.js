@@ -2720,15 +2720,13 @@ window.addEventListener('mouseup', () => {
     drawLeft();
     markTrimDirty();
   } else if (tlDrag && tlDrag.kind === 'speedEdge') {
+    // Stays unlocked: adjusting a region is usually several drags, and locking
+    // after each one made the user hunt for the badge again every time.
     normalizeSpeeds();
-    // The edit session ends with the drag: the user gets one deliberate
-    // adjustment, then the region locks again so a stray drag cannot move it.
-    state.speedEdit = -1;
     syncSpeedControls();
     drawTimeline();
     drawLeft();
     markTrimDirty();
-    toast('已锁定该区间；再次点锁钮可继续调整', 1800);
   }
   if (state.dragHint) {
     state.dragHint = null;

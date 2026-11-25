@@ -1966,7 +1966,30 @@ function keptSegs() {
 // Every stretch of the timeline with one constant speed, as
 // {o: output start, a, b: source span, speed}. Both the preview clock and the
 // duration estimate walk this, so they cannot drift apart.
+// Playback asks for the piece layout several times a frame (the clock, the
+// duration, the timeline chip), and every call rebuilt it from the regions.
+// With regions stacked the cut list grows quickly, so remember the result and
+// only rebuild when the edit itself changes.
+let pieceCache = { key: '', pieces: [] };
+
+function piecesKey() {
+  return [
+    state.clip ? state.clip.dir : '',
+    state.bake ? state.bake.frames : 0,
+    state.trims.map((t) => `${t.a.toFixed(4)}:${t.b.toFixed(4)}`).join(','),
+    state.speeds.map((s) => `${s.a.toFixed(4)}:${s.b.toFixed(4)}:${s.speed}`).join(','),
+  ].join('|');
+}
+
 function timelinePieces() {
+  const key = piecesKey();
+  if (pieceCache.key === key) return pieceCache.pieces;
+  const pieces = buildPieces();
+  pieceCache = { key, pieces };
+  return pieces;
+}
+
+function buildPieces() {
   const fps = state.bake ? state.bake.fps : 30;
   const pieces = [];
   let o = 0;
@@ -2798,18 +2821,19 @@ function playVideos(on) {
     playOutAtStart = srcToOut(state.frame / fps);
     playOutT = playOutAtStart;
     playOutStart = performance.now();
+    proxySeekTick = 0;
     const piece = pieceAt(playOutT);
     const at = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
     if (playingWithProxy()) {
       // The proxy has trims and speeds baked in: it is a timeline in its own
       // right, so it plays straight through from output second 0. The master
-      // still has to PLAY - it is the left viewport's picture - so it follows
-      // at the region's rate and is re-synced whenever it drifts.
+      // only feeds the left viewport: leaving it paused and stepping it every
+      // few frames keeps its decoder idle instead of competing with the proxy.
       try { c.currentTime = playOutT; c.play().catch(() => {}); } catch {}
       try {
         v.currentTime = at;
-        v.playbackRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
-        v.play().catch(() => {});
+        v.playbackRate = 1;
+        v.pause();
       } catch {}
     } else {
       // No proxy: the master is the moving picture, so it plays at the region's
@@ -2827,6 +2851,8 @@ function playVideos(on) {
     try { v.playbackRate = 1; } catch {}
   }
 }
+
+let proxySeekTick = 0;
 
 function tickVideo() {
   if (!state.playing) return;
@@ -2858,11 +2884,15 @@ function tickVideo() {
       try { v.currentTime = srcT; } catch {}
     }
   } else if (playingWithProxy() && state.useVideo && v.readyState >= 2) {
-    const wantRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
-    if (Math.abs(v.playbackRate - wantRate) > 0.01) {
-      try { v.playbackRate = wantRate; } catch {}
+    // The proxy already carries the speed: it IS the edited timeline, and the
+    // master only feeds the left viewport. Seeking it every frame kept the
+    // decoder busy enough to stall the proxy's playback, so it is stepped a few
+    // frames at a time instead - the left pane reads as a preview of the take,
+    // not as the thing being watched.
+    if (v.playbackRate !== 1) {
+      try { v.playbackRate = 1; } catch {}
     }
-    if (Math.abs(v.currentTime - srcT) > 0.25) {
+    if (++proxySeekTick % 4 === 0 && Math.abs(v.currentTime - srcT) > 0.25) {
       try { v.currentTime = srcT; } catch {}
     }
   }

@@ -2540,24 +2540,16 @@ tlCanvas.addEventListener('mousedown', (ev) => {
         return;
       }
     }
-    // Selecting an existing region is just a side effect of where the drag
-    // starts: the drag itself must still be free to lay a new region on top,
-    // which is how a span gets sped up twice. With a region unlocked its edges
-    // were handled above, so a click inside it falls through to here.
-    for (let i = 0; i < se.length; i++) {
-      if (x >= se[i].a - 4 && x <= se[i].b + 4) {
-        state.speedSel = i;
-        syncSpeedControls();
-        break;
-      }
-    }
-    pushUndo();
-    const t = snapTime(xToTime(g, x));
-    state.speeds.push({ a: t, b: t, speed: 2 });
-    state.speedSel = state.speeds.length - 1;
-    tlDrag = { kind: 'speedNew', i: state.speeds.length - 1 };
-    tlDragAnchor = t;
-    drawTimeline();
+    // A press that turns into a drag lays a new region; a press that never
+    // moves just selects the one under the pointer, so its factor can be read
+    // and changed without accidentally stacking an empty region on top.
+    const hit = se.findIndex((e) => x >= e.a - 4 && x <= e.b + 4);
+    tlDrag = {
+      kind: 'speedPress',
+      i: hit,
+      anchorX: x,
+      anchorT: snapTime(xToTime(g, x)),
+    };
     return;
   }
   if (state.trimMode) {
@@ -2652,6 +2644,17 @@ window.addEventListener('mousemove', (ev) => {
     return;
   }
 
+  // A pending press becomes a new region only once the pointer has actually
+  // travelled; below the threshold it is still a click on whatever it was over.
+  if (tlDrag.kind === 'speedPress') {
+    if (Math.abs(x - tlDrag.anchorX) < 3) return;   // still a click so far
+    pushUndo();
+    const t0 = tlDrag.anchorT;
+    state.speeds.push({ a: t0, b: t0, speed: 2 });
+    state.speedSel = state.speeds.length - 1;
+    tlDrag = { kind: 'speedNew', i: state.speeds.length - 1 };
+    tlDragAnchor = t0;
+  }
   if (tlDrag.kind === 'speedNew' || tlDrag.kind === 'speedEdge') {
     const region = state.speeds[tlDrag.i];
     if (!region) return;
@@ -2701,6 +2704,16 @@ window.addEventListener('mouseup', () => {
     drawTimeline();
     drawLeft();
     markTrimDirty();
+  } else if (tlDrag && tlDrag.kind === 'speedPress') {
+    // Never moved: this was a click, so select the region it landed on, or
+    // move the playhead when it landed on empty lane.
+    if (tlDrag.i >= 0) {
+      state.speedSel = tlDrag.i;
+      syncSpeedControls();
+      drawTimeline();
+    } else {
+      seekToTime(tlDrag.anchorT);
+    }
   } else if (tlDrag && tlDrag.kind === 'speedNew') {
     const fps = state.bake ? state.bake.fps : 30;
     const region = state.speeds[tlDrag.i];

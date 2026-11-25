@@ -2821,7 +2821,6 @@ function playVideos(on) {
     playOutAtStart = srcToOut(state.frame / fps);
     playOutT = playOutAtStart;
     playOutStart = performance.now();
-    proxySeekTick = 0;
     const piece = pieceAt(playOutT);
     const at = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
     if (playingWithProxy()) {
@@ -2852,8 +2851,6 @@ function playVideos(on) {
   }
 }
 
-let proxySeekTick = 0;
-
 function tickVideo() {
   if (!state.playing) return;
   const fps = state.bake ? state.bake.fps : 30;
@@ -2883,19 +2880,12 @@ function tickVideo() {
     if (Math.abs(v.currentTime - srcT) > 0.20) {
       try { v.currentTime = srcT; } catch {}
     }
-  } else if (playingWithProxy() && state.useVideo && v.readyState >= 2) {
-    // The proxy already carries the speed: it IS the edited timeline, and the
-    // master only feeds the left viewport. Seeking it every frame kept the
-    // decoder busy enough to stall the proxy's playback, so it is stepped a few
-    // frames at a time instead - the left pane reads as a preview of the take,
-    // not as the thing being watched.
-    if (v.playbackRate !== 1) {
-      try { v.playbackRate = 1; } catch {}
-    }
-    if (++proxySeekTick % 4 === 0 && Math.abs(v.currentTime - srcT) > 0.25) {
-      try { v.currentTime = srcT; } catch {}
-    }
   }
+  // With a proxy the master is not needed for playback at all: the proxy
+  // carries the edit and is what the user watches. Seeking a 4K take mid-play
+  // costs a full-resolution decode, measured at roughly double the frame budget
+  // even at one seek every 15 frames, so it stays parked where it was and is
+  // re-seeked once playback stops.
 
   drawTimeline();
   drawLeft();
